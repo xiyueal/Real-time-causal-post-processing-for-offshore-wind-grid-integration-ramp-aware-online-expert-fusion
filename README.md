@@ -1,37 +1,47 @@
 # Ramp-Aware Online Kalman-Filter Fusion for Offshore Wind Forecast Bias Correction and Ramp Event Prediction
 
-This repository contains the Python implementation and datasets used in the experiments of the paper:
+This repository contains the Python implementation, processed datasets, and experimental scripts used in the study:
 
-**"Ramp-Aware Online Kalman-Filter Fusion for Offshore Wind Forecast Bias Correction and Ramp Event Prediction"**
+**"Ramp-Aware Online Kalman-Filter Fusion for Offshore Wind Forecast Bias Correction and Ramp Event Prediction."**
 
-The project provides an online ramp-aware Kalman-filter fusion framework designed to correct offshore wind forecast bias and enhance ramp event prediction performance.
+The project proposes an online ramp-aware Kalman-filter fusion method designed to correct offshore wind forecast bias and improve ramp event prediction performance.
 
 ---
 
-## 📌 Usage Restrictions & Copyright
+## ⚠️ Usage Restrictions & Copyright Statement
 
-1. **This project is intended solely for scientific research. All rights are reserved by the author team.**  
-2. Any commercial use, redistribution, or derivative development without explicit permission is strictly prohibited.  
-3. The authors reserve the right to pursue legal action against unauthorized commercial usage or re-development of this open-source project.
+**This project is intended solely for scientific research purposes, and all copyrights belong to the author team.**
+
+Any form of **commercial use, redistribution, or derivative development without explicit permission is strictly prohibited.**  
+The authors reserve the legal right to pursue prosecution against unauthorized commercial applications or modifications of this open-source project.
 
 ---
 
 ## 📊 Data Sources
 
-The datasets used in this project originate from publicly available numerical weather prediction (NWP) systems, as described in the paper:
+The datasets used in this study originate from publicly available numerical weather prediction (NWP) systems mentioned in the paper:
 
-### **1. U.S. Offshore Wind-Speed Forecast Data**
-- Source: **NOAA HRRR (High-Resolution Rapid Refresh)**  
-- Description: A high-resolution operational NWP model provided by the National Oceanic and Atmospheric Administration (NOAA).  
-- Access:  
- https://registry.opendata.aws/noaa-hrrr-pds/
+### **1. U.S. Offshore Wind Forecast Data**
+- **Source:** NOAA HRRR (High-Resolution Rapid Refresh)  
+- **Description:** A high-resolution operational weather forecast model developed by NOAA  
+- **Access:**  
+  https://registry.opendata.aws/noaa-hrrr-pds/
 
-### **2. China Offshore Wind-Speed Forecast Data**
-- Source: **CMA-GFS (China Meteorological Administration Global Forecast System)**  
-- Access Portal:  
- http://data.cma.cn/
+### **2. China Offshore Wind Forecast Data**
+- **Source:** CMA-GFS (China Meteorological Administration Global Forecast System)  
+- **Access:**  
+  http://data.cma.cn/
 
-All preprocessed datasets included in this repository were derived from the above publicly available sources.
+All processed datasets included in this repository were derived from these publicly available NWP sources.
 
 ---
 
+## 📬 Contact
+
+If you cannot run the code or encounter problems when using the project, you may contact:
+
+**Email:** 1557196087@qq.com
+
+The author will provide necessary support regarding technical or usage issues.
+
+---
