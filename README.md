@@ -1,8 +1,8 @@
-# Ramp-Aware Online Kalman-Filter Fusion for Offshore Wind Forecast Bias Correction and Ramp Event Prediction
+# Real-time causal post-processing for offshore wind grid integration: ramp-aware online expert fusion to reduce dispatch mismatch and reserve risk
 
 This repository contains the Python implementation, processed datasets, and experimental scripts used in the study:
 
-**"Ramp-Aware Online Kalman-Filter Fusion for Offshore Wind Forecast Bias Correction and Ramp Event Prediction."**
+**"Real-time causal post-processing for offshore wind grid integration: ramp-aware online expert fusion to reduce dispatch mismatch and reserve risk."**
 
 The project proposes an online ramp-aware Kalman-filter fusion method designed to correct offshore wind forecast bias and improve ramp event prediction performance.
 
