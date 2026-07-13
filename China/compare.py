@@ -10,7 +10,6 @@ from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_f
 warnings.filterwarnings("ignore")
 
 from lightgbm import LGBMRegressor
-from lightgbm import early_stopping
 
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Conv1D, GlobalAveragePooling1D, BatchNormalization
@@ -27,20 +26,19 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 
 
 # ==============================
-# ✅ 固定时间分区（你新要求的）
-# 数据：2021-09-01 00:00:00 ~ 2022-08-31 00:00:00
-# 训练=前8个月；验证=中2个月；测试=最后2个月
+# ✅ 固定时间分区（你要求的）
+# 训练=2023全年；验证=2024前2个月；测试=2024后10个月
 # ==============================
-TRAIN_START = pd.Timestamp("2021-09-01 00:00:00")
-TRAIN_END   = pd.Timestamp("2022-04-30 23:59:59")
+TRAIN_START = pd.Timestamp("2023-01-01 00:00:00")
+TRAIN_END   = pd.Timestamp("2023-12-31 23:59:59")
 
-VAL_START   = pd.Timestamp("2022-05-01 00:00:00")
-VAL_END     = pd.Timestamp("2022-06-30 23:59:59")
+VAL_START   = pd.Timestamp("2024-01-01 00:00:00")
+VAL_END     = pd.Timestamp("2024-02-29 23:59:59")  # 2024闰年
 
-TEST_START  = pd.Timestamp("2022-07-01 00:00:00")
-TEST_END    = pd.Timestamp("2022-08-31 23:59:59")
+TEST_START  = pd.Timestamp("2024-03-01 00:00:00")
+TEST_END    = pd.Timestamp("2024-12-31 23:59:59")
 
-# 只用这一年
+# 只用 2023-2024 两年（建议强制过滤）
 DATA_START  = TRAIN_START
 DATA_END    = TEST_END
 
@@ -74,7 +72,7 @@ def save_png_and_eps(filename, dpi=300, fig=None):
 # ==============================
 def find_wind_col(df):
    for c in df.columns:
-       if "WindSpeed" in str(c):
+       if "wind80m" in str(c):
            return c
    raise ValueError("找不到 wind80m 列，请检查表头（列名中要包含 'wind80m'）")
 
@@ -108,6 +106,136 @@ def windspeed_to_power(u,
    u = np.asarray(u, dtype=float)
    return B + (T - B) / (1.0 + 10.0 ** (b * (xmid - u))) ** s
 
+def kalman_regression_delayed(yt, Zt, q=1e-3, r=1.0, feedback_delay_steps=0):
+   """
+   延迟反馈版 Kalman bias regression。
+
+   delay=0：等价于原始在线更新；
+   delay=1：当前预测时刻不能使用最新 1 个时间步的反馈；
+   delay=2：当前预测时刻不能使用最新 2 个时间步的反馈。
+   """
+   yt = np.asarray(yt, dtype=float)
+   Zt = np.asarray(Zt, dtype=float)
+
+   n, p = Zt.shape
+   feedback_delay_steps = int(feedback_delay_steps)
+
+   beta = np.zeros(p)
+   P = np.eye(p) * 1000.0
+   Q = np.eye(p) * q
+   R = float(r)
+   I = np.eye(p)
+
+   beta_hist = np.zeros((n, p))
+   bias_pred = np.zeros(n)
+   bias_filt = np.zeros(n)
+
+   for t in range(n):
+       z_now = Zt[t, :].reshape(-1, 1)
+
+       beta_pred = beta.copy()
+       P_pred = P + Q
+
+       # 当前时刻的前验偏差预测
+       y_pred_now = (z_now.T @ beta_pred.reshape(-1, 1)).item()
+       bias_pred[t] = y_pred_now
+
+       # 延迟反馈：只能更新 t - delay 对应的历史误差
+       update_idx = t - feedback_delay_steps
+
+       if update_idx >= 0:
+           z_update = Zt[update_idx, :].reshape(-1, 1)
+           y_update_pred = (z_update.T @ beta_pred.reshape(-1, 1)).item()
+
+           S = (z_update.T @ P_pred @ z_update).item() + R
+           if (not np.isfinite(S)) or S <= 1e-12:
+               S = 1e-12
+
+           K = (P_pred @ z_update / S).flatten()
+           innovation = yt[update_idx] - y_update_pred
+
+           beta = beta_pred + K * innovation
+
+           # Joseph form，提高数值稳定性
+           A = I - np.outer(K, z_update.flatten())
+           P = A @ P_pred @ A.T + np.outer(K, K) * R
+           P = 0.5 * (P + P.T)
+       else:
+           beta = beta_pred
+           P = P_pred
+
+       beta_hist[t, :] = beta
+       bias_filt[t] = (z_now.T @ beta.reshape(-1, 1)).item()
+
+   return beta_hist, bias_pred, bias_filt
+
+
+def EMA_bias_prediction_delayed(fc, obs, alpha=0.1, feedback_delay_steps=0):
+   """
+   延迟反馈版 EMA bias correction。
+   delay=0 时等价于原始 EMA。
+   """
+   fc = np.asarray(fc, dtype=float)
+   obs = np.asarray(obs, dtype=float)
+
+   n = len(fc)
+   feedback_delay_steps = int(feedback_delay_steps)
+
+   b = 0.0
+   bias_pred = np.zeros(n)
+
+   for t in range(n):
+       # 当前时刻只能使用之前已经更新好的偏差估计
+       bias_pred[t] = b
+
+       update_idx = t - feedback_delay_steps
+       if update_idx >= 0:
+           err_t = fc[update_idx] - obs[update_idx]
+           b = (1 - alpha) * b + alpha * err_t
+
+   return bias_pred
+
+def compute_ramp_flag_pred_delayed(provisional_fc, obs_series, ramp_th, feedback_delay_steps=0):
+   """
+   根据临时修正预测和可获得的历史观测，生成 ramp-aware 标签。
+
+   原始无延迟：
+       t 时刻用 obs[t-1] 作为参考。
+
+   delay=1：
+       t 时刻只能用 obs[t-2] 作为参考。
+
+   delay=2：
+       t 时刻只能用 obs[t-3] 作为参考。
+   """
+   provisional_fc = np.asarray(provisional_fc, dtype=float)
+   obs_series = np.asarray(obs_series, dtype=float)
+
+   n = len(provisional_fc)
+   feedback_delay_steps = int(feedback_delay_steps)
+
+   ramp_flag_pred = np.zeros(n, dtype=int)
+
+   P_fc = windspeed_to_power(provisional_fc)
+   P_obs = windspeed_to_power(obs_series)
+
+   for t in range(n):
+       ref_idx = t - 1 - feedback_delay_steps
+
+       if ref_idx < 0:
+           ramp_flag_pred[t] = 0
+           continue
+
+       diffP_pred = P_fc[t] - P_obs[ref_idx]
+
+       if diffP_pred >= ramp_th:
+           ramp_flag_pred[t] = 1
+       elif diffP_pred <= -ramp_th:
+           ramp_flag_pred[t] = 2
+       else:
+           ramp_flag_pred[t] = 0
+
+   return ramp_flag_pred
 
 def kalman_regression(yt, Zt, q=1e-3, r=1.0):
    yt = np.asarray(yt, dtype=float)
@@ -309,7 +437,7 @@ def compute_ramp_accuracy(fc_series, obs_series, ramp_th):
 def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
                           test_start_time, window_size, ramp_th):
    """
-   ✅ 固定只用【训练期（前8个月）】训练 ramp-skill（不看 验证/测试）
+   ✅ 固定只用 2023 年训练 ramp-skill（不看 2024 验证/测试）
    """
    fc_series = np.asarray(fc_series, dtype=float)
    obs_series = np.asarray(obs_series, dtype=float)
@@ -318,8 +446,8 @@ def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
    if n < window_size + 30:
        return 1.0
 
-   # 训练结束固定为验证开始时间（VAL_START），即只用训练期
-   train_end_time = VAL_START
+   # 训练结束固定为 2024-01-01（只用 2023）
+   train_end_time = pd.Timestamp("2024-01-01 00:00:00")
    train_end_time = min(train_end_time, test_start_time)
 
    train_mask_all_ts = time_series < train_end_time
@@ -433,7 +561,6 @@ def _enforce_min_weights(w, indices, min_w):
        w /= s
    return w
 
-
 def kalman_dynamic_fusion(
    fc_list,
    obs,
@@ -450,11 +577,34 @@ def kalman_dynamic_fusion(
    min_ramp_down_weight_indices=None,
    min_weight_up=0.3,
    min_weight_down=0.3,
+   feedback_delay_steps=0,
 ):
+   """
+   在线 Kalman 动态融合。
+
+   feedback_delay_steps:
+       0 = 原始设定，无额外反馈延迟；
+       1 = 观测反馈延迟 1 个时间步；
+       2 = 观测反馈延迟 2 个时间步。
+
+   注意：
+       本函数延迟的是 Kalman 权重更新所使用的观测反馈。
+       当前时刻 t 的前验融合预测仍使用当前时刻各专家预测 H_now。
+       但是权重更新时，只允许使用 t - feedback_delay_steps 时刻及以前可获得的观测反馈。
+   """
+
    obs = np.asarray(obs, dtype=float)
    fc_arrs = [np.asarray(fc, dtype=float) for fc in fc_list]
    n = len(obs)
    M = len(fc_arrs)
+
+   feedback_delay_steps = int(feedback_delay_steps)
+   if feedback_delay_steps < 0:
+       raise ValueError("feedback_delay_steps 必须为非负整数，例如 0、1、2。")
+
+   for fc in fc_arrs:
+       if len(fc) != n:
+           raise ValueError("fc_list 中每个序列长度必须与 obs 长度一致")
 
    w = np.ones(M) / M
    P = np.eye(M) * 100.0
@@ -477,20 +627,34 @@ def kalman_dynamic_fusion(
    calm_pref_indices = set(calm_pref_indices or [])
 
    for t in range(n):
-       H = np.array([fc_arrs[m][t] for m in range(M)]).reshape(1, -1)
 
-       w_pred = w
+       # ==============================
+       # 1) 当前时刻 t 的专家预测向量
+       #    注意：预测数据不延迟
+       # ==============================
+       H_now = np.array([fc_arrs[m][t] for m in range(M)]).reshape(1, -1)
+
+       # ==============================
+       # 2) 状态预测
+       # ==============================
+       w_pred = w.copy()
        P_pred = P + Q
 
+       # ==============================
+       # 3) 当前时刻的 ramp-aware 先验重加权
+       #    这里仍然作用于当前时刻 t 的融合预测
+       # ==============================
        if has_ramp_logic:
            if ramp_flags[t] == 1:
                for idx in ramp_up_indices:
                    if 0 <= idx < M:
                        w_pred[idx] *= ramp_up_boost_factor
+
            elif ramp_flags[t] == 2:
                for idx in ramp_down_indices:
                    if 0 <= idx < M:
                        w_pred[idx] *= ramp_down_boost_factor
+
            else:
                for idx in calm_pref_indices:
                    if 0 <= idx < M:
@@ -503,15 +667,51 @@ def kalman_dynamic_fusion(
        else:
            w_pred = np.ones(M) / M
 
-       y_prior = float(H @ w_pred.reshape(-1, 1))
-       fc_fuse_prior[t] = y_prior
+       # ==============================
+       # 4) 输出当前时刻的前验预测
+       #    这是你后面用于评估的 fc_fuse_prior
+       # ==============================
+       y_prior_now = float(H_now @ w_pred.reshape(-1, 1))
+       fc_fuse_prior[t] = y_prior_now
 
-       S = float(H @ P_pred @ H.T + R)
-       K = (P_pred @ H.T) / S
+       # ==============================
+       # 5) 延迟反馈更新
+       #    delay=0：用 obs[t] 更新，等价于原始在线更新
+       #    delay=1：当前时刻只能收到 obs[t-1] 对应的反馈
+       #    delay=2：当前时刻只能收到 obs[t-2] 对应的反馈
+       #
+       #    关键：更新时使用对应历史时刻的专家向量 H_update，
+       #    而不是错误地用当前 H_now 去匹配历史 obs。
+       # ==============================
+       update_idx = t - feedback_delay_steps
 
-       w = w_pred + (K.flatten() * (obs[t] - y_prior))
-       P = (I - K @ H) @ P_pred
+       if update_idx >= 0:
+           H_update = np.array([fc_arrs[m][update_idx] for m in range(M)]).reshape(1, -1)
 
+           y_update_prior = float(H_update @ w_pred.reshape(-1, 1))
+
+           S = float(H_update @ P_pred @ H_update.T + R)
+           if (not np.isfinite(S)) or S <= 1e-12:
+               S = 1e-12
+
+           K = (P_pred @ H_update.T) / S
+
+           innovation = obs[update_idx] - y_update_prior
+           w = w_pred + K.flatten() * innovation
+
+           # Joseph form，数值上比 P=(I-KH)P 更稳定
+           A = I - K @ H_update
+           P = A @ P_pred @ A.T + (K @ K.T) * R
+           P = 0.5 * (P + P.T)
+
+       else:
+           # 延迟条件下，初始几个时刻还没有反馈可用
+           w = w_pred
+           P = P_pred
+
+       # ==============================
+       # 6) 权重非负和归一化
+       # ==============================
        w = np.maximum(w, 0.0)
        s = w.sum()
        if s > 0:
@@ -519,17 +719,20 @@ def kalman_dynamic_fusion(
        else:
            w = np.ones(M) / M
 
+       # ==============================
+       # 7) ramp 情况下的最小权重约束
+       # ==============================
        if has_ramp_logic:
            if ramp_flags[t] == 1 and min_ramp_up_weight_indices:
                w = _enforce_min_weights(w, min_ramp_up_weight_indices, min_weight_up)
            elif ramp_flags[t] == 2 and min_ramp_down_weight_indices:
                w = _enforce_min_weights(w, min_ramp_down_weight_indices, min_weight_down)
-           elif ramp_flags[t] == 0 and calm_pref_indices:
-               w = _enforce_min_weights(w, calm_pref_indices, 0.7)
+
        w_hist[t, :] = w
-       fc_fuse_post[t] = float(H @ w.reshape(-1, 1))
+       fc_fuse_post[t] = float(H_now @ w.reshape(-1, 1))
 
    return w_hist, fc_fuse_prior, fc_fuse_post
+
 
 
 def plot_obs_and_fuse_with_ramps(time_test, obs_test, fc_test, fc_RAW_test,
@@ -582,15 +785,18 @@ def print_fusion_weight_by_ramp(w_hist, ramp_flags, model_names, lead_hour, fusi
 
 
 # ==============================
-# 配置：改成预报-实况一一对应
+# 配置
 # ==============================
-pairs = {
-   "006": ("wind_006.xlsx", "18点实测风速.xlsx"),
-   "012": ("wind_012.xlsx", "0点实测风速.xlsx"),
-   "018": ("wind_018.xlsx", "6点实测风速.xlsx"),
-   "024": ("wind_024.xlsx", "12点实测风速.xlsx"),
-   "030": ("wind_030.xlsx", "18点实测风速.xlsx"),
+lead_pairs = {
+   3:  "wind_fcst03.xlsx",
+   6:  "wind_fcst06.xlsx",
+   9:  "wind_fcst09.xlsx",
+   12: "wind_fcst12.xlsx",
+   15: "wind_fcst15.xlsx",
+   18: "wind_fcst18.xlsx",
 }
+
+obs_file = "wind_timeseries.xlsx"
 
 WINDOW_SIZE = 24
 
@@ -613,57 +819,62 @@ RAMP_TH = 0.2
 RAMP_UP_WEIGHT = 3.5
 RAMP_DOWN_WEIGHT = 3.5
 
-CALM_BOOST_FACTOR = 4.0
+CALM_BOOST_FACTOR = 2.0
 RAMP_UP_BOOST_FACTOR = 2.0
 RAMP_DOWN_BOOST_FACTOR = 2.0
 
 FUSE_TOPK = 8
 
+# ==============================
+# ✅ 反馈延迟敏感性实验
+# delay=0：原始在线权重更新
+# delay=1：观测反馈延迟 1 个时间步
+# delay=2：观测反馈延迟 2 个时间步
+# 注意：这里延迟的是 Kalman 融合权重更新中的观测反馈，不是把预测数据整体平移
+# ==============================
+FEEDBACK_DELAYS = [0, 1, 2]
+
 summary_rows = []
 ramp_metrics_summary_rows = []
+delay_sensitivity_rows = []
+
 
 
 # ==============================
-# 主循环：遍历各 lead / 文件对
+# 读取实况
 # ==============================
-for lead_code, (fcst_file, obs_file) in pairs.items():
-   lead_hour = int(lead_code)   # 保留 lead 小时数，用于打印/文件命名
+obs_df = pd.read_excel(obs_file)
+if "Time" not in obs_df.columns:
+   raise ValueError("实况文件中必须包含 'Time' 列，请检查 wind_timeseries.xlsx。")
+obs_df["Time"] = pd.to_datetime(obs_df["Time"])
+obs_col = find_wind_col(obs_df)
+obs_df = obs_df[["Time", obs_col]].rename(columns={obs_col: "Obs"})
 
+# ✅ 强制过滤到 2023-2024
+obs_df = obs_df[(obs_df["Time"] >= DATA_START) & (obs_df["Time"] <= DATA_END)].copy()
+obs_df = obs_df.sort_values("Time").reset_index(drop=True)
+
+
+# ==============================
+# 主循环：遍历各 lead
+# ==============================
+for lead_hour, fcst_file in lead_pairs.items():
    print(f"\n====================")
-   print(f"  Lead = {lead_hour} h (代码 {lead_code})")
-   print(f"  预报文件: {fcst_file}")
-   print(f"  实况文件: {obs_file}")
+   print(f"  Lead = {lead_hour} h")
    print(f"====================")
 
-   # ========= 读取实况 =========
-   obs_df = pd.read_excel(obs_file)
-   if "Time" not in obs_df.columns:
-       raise ValueError(f"实况文件 {obs_file} 中必须包含 'Time' 列，请检查。")
-   obs_df["Time"] = pd.to_datetime(obs_df["Time"])
-   obs_col = find_wind_col(obs_df)
-   obs_df = obs_df[["Time", obs_col]].rename(columns={obs_col: "Obs"})
-
-   # ✅ 强制过滤到 2021-09 ~ 2022-08
-   obs_df = obs_df[(obs_df["Time"] >= DATA_START) & (obs_df["Time"] <= DATA_END)].copy()
-   obs_df = obs_df.sort_values("Time").reset_index(drop=True)
-
-   # ========= 读取预报 =========
    fc_df = pd.read_excel(fcst_file)
    if "Time" not in fc_df.columns:
        raise ValueError(f"{fcst_file} 中必须包含 'Time' 列，请检查。")
 
    fc_df["Time"] = pd.to_datetime(fc_df["Time"])
-   fc_col = find_wind_col
-
-
    fc_col = find_wind_col(fc_df)
    fc_df = fc_df[["Time", fc_col]].rename(columns={fc_col: "Fcst"})
 
-   # 过滤 2021-09 到 2022-08
+   # ✅ 强制过滤到 2023-2024
    fc_df = fc_df[(fc_df["Time"] >= DATA_START) & (fc_df["Time"] <= DATA_END)].copy()
    fc_df = fc_df.sort_values("Time").reset_index(drop=True)
 
-   # ========= 合并预报和实况 =========
    df = pd.merge(fc_df, obs_df, on="Time", how="inner").dropna().sort_values("Time")
    df = df.reset_index(drop=True)
 
@@ -673,7 +884,7 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
 
    print(f"  总数据量：{len(df)}  时间：{df['Time'].min()} ~ {df['Time'].max()}")
 
-   # ========= 构造特征（完全保留你的结构） =========
+   # ========= Step 1: 构造特征 =========
    tmp = df.copy()
    tmp["hour"] = tmp["Time"].dt.hour
    tmp["month"] = tmp["Time"].dt.month
@@ -708,30 +919,49 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
 
    bias_eff0 = fc_eff0 - obs_eff0
 
-   # ramp 相关标签
    P_obs_eff0 = windspeed_to_power(obs_eff0)
    obs_diffP0 = pd.Series(P_obs_eff0).diff().values
    ramp_flag_up0 = (obs_diffP0 >= RAMP_TH).astype(int)
    ramp_flag_down0 = (obs_diffP0 <= -RAMP_TH).astype(int)
    ramp_flag_obs0 = (np.abs(obs_diffP0) >= RAMP_TH).astype(int)
-
    ramp_flag_up0[0] = ramp_flag_down0[0] = ramp_flag_obs0[0] = 0
 
    feature_cols = [c for c in eff_tmp.columns if c not in ["Time", "Obs"]]
    X_lgb0 = eff_tmp[feature_cols].values
 
-   # ========= Kalman Filter / EMA =========
+   # ========= Step 2: KF / EMA，加入反馈延迟版本 =========
    yt0 = bias_eff0
    Zt0 = np.column_stack([np.ones(n0), fc_eff0])
-   _, bias_pred_kf0, _ = kalman_regression(yt0, Zt0, q=KF_Q, r=KF_R)
-   fc_kf_eff0 = fc_eff0 - bias_pred_kf0
 
-   bias_pred_EMA0 = EMA_bias_prediction(fc_eff0, obs_eff0, alpha=ALPHA_EMA)
-   fc_EMA_eff0 = fc_eff0 - bias_pred_EMA0
+   fc_kf_eff0_by_delay = {}
+   fc_EMA_eff0_by_delay = {}
 
-   # ========= LSTM / TCN 特征准备 =========
+   for delay_steps in FEEDBACK_DELAYS:
+       _, bias_pred_kf0_d, _ = kalman_regression_delayed(
+           yt0,
+           Zt0,
+           q=KF_Q,
+           r=KF_R,
+           feedback_delay_steps=delay_steps
+       )
+       fc_kf_eff0_by_delay[delay_steps] = fc_eff0 - bias_pred_kf0_d
+
+       bias_pred_EMA0_d = EMA_bias_prediction_delayed(
+           fc_eff0,
+           obs_eff0,
+           alpha=ALPHA_EMA,
+           feedback_delay_steps=delay_steps
+       )
+       fc_EMA_eff0_by_delay[delay_steps] = fc_eff0 - bias_pred_EMA0_d
+
+   # 保留无延迟版本，避免后面原代码大量改动
+   fc_kf_eff0 = fc_kf_eff0_by_delay[0]
+   fc_EMA_eff0 = fc_EMA_eff0_by_delay[0]
+
+
+   # ========= Step 3: LSTM / TCN =========
    if n0 <= WINDOW_SIZE + 30:
-       print(f"  有效样本 {n0} 不足训练深度模型，跳过该 Lead。")
+       print(f"  有效样本 {n0} 仍偏少，不足以训练 LSTM/TCN，跳过该 Lead。")
        continue
 
    fc_diff1_eff = eff_tmp["Fcst_diff1"].fillna(0.0).values
@@ -751,12 +981,11 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        diffP_fc_sign_eff,
    ])
 
-   # === Strict scaler fit only on TRAIN period ===
+   # ✅ 用 eff 层面的时间序列做 scaler 的训练掩码（严格只用 2023）
    time_series_all = pd.to_datetime(time_eff0)
    train_mask_all0 = (time_series_all >= TRAIN_START) & (time_series_all <= TRAIN_END)
-
    if train_mask_all0.sum() < 50:
-       print("  训练期数据太少，跳过该 Lead。")
+       print("  训练样本太少（用于 fit scaler，仅 2023），跳过该 Lead。")
        continue
 
    scaler_X = StandardScaler()
@@ -770,23 +999,35 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
    X_seq, y_seq = build_sequences(features_scaled, bias_scaled, WINDOW_SIZE)
    n_features_seq = features_scaled.shape[1]
 
-   # === 时间映射回 sequence ===
    time_seq = time_eff0[WINDOW_SIZE - 1:]
    fc_seq = fc_eff0[WINDOW_SIZE - 1:]
    obs_seq = obs_eff0[WINDOW_SIZE - 1:]
    ramp_flag_obs_seq = ramp_flag_obs0[WINDOW_SIZE - 1:]
    ramp_flag_up_seq = ramp_flag_up0[WINDOW_SIZE - 1:]
    ramp_flag_down_seq = ramp_flag_down0[WINDOW_SIZE - 1:]
+   n = len(time_seq)
 
    fc_RAW_eff = fc_eff0[WINDOW_SIZE - 1:]
-   fc_kf_eff = fc_kf_eff0[WINDOW_SIZE - 1:]
-   fc_EMA_eff = fc_EMA_eff0[WINDOW_SIZE - 1:]
+   fc_kf_eff_by_delay = {
+       d: fc_kf_eff0_by_delay[d][WINDOW_SIZE - 1:]
+       for d in FEEDBACK_DELAYS
+   }
+
+   fc_EMA_eff_by_delay = {
+       d: fc_EMA_eff0_by_delay[d][WINDOW_SIZE - 1:]
+       for d in FEEDBACK_DELAYS
+   }
+
+   # 无延迟版本，保持原变量名
+   fc_kf_eff = fc_kf_eff_by_delay[0]
+   fc_EMA_eff = fc_EMA_eff_by_delay[0]
+
    X_lgb = X_lgb0[WINDOW_SIZE - 1:]
    bias_eff = bias_eff0[WINDOW_SIZE - 1:]
 
    time_series = pd.to_datetime(time_seq)
 
-   # ========= 新时间分区 Train / Val / Test（严格保持你原结构） =========
+   # ========= ✅ Step 3.5: 固定日历 train/val/test =========
    train_mask = (time_series >= TRAIN_START) & (time_series <= TRAIN_END)
    val_mask   = (time_series >= VAL_START)   & (time_series <= VAL_END)
    test_mask  = (time_series >= TEST_START)  & (time_series <= TEST_END)
@@ -796,20 +1037,20 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
    test_idx  = np.where(test_mask)[0]
 
    if len(train_idx) < 50:
-       print("训练集太少，跳过。")
+       print("  训练集样本过少（2023），跳过该 Lead。")
        continue
    if len(val_idx) < 10:
-       print("验证集太少，跳过。")
+       print("  验证集样本过少（2024-01~02），跳过该 Lead。")
        continue
    if len(test_idx) < 10:
-       print("测试集太少，跳过。")
+       print("  测试集样本过少（2024-03~12），跳过该 Lead。")
        continue
 
-   print(f"  训练集: {time_series[train_idx[0]]} ~ {time_series[train_idx[-1]]}  ({len(train_idx)})")
-   print(f"  验证集: {time_series[val_idx[0]]} ~ {time_series[val_idx[-1]]}  ({len(val_idx)})")
-   print(f"  测试集: {time_series[test_idx[0]]} ~ {time_series[test_idx[-1]]}  ({len(test_idx)})")
+   print(f"  训练集: {time_series[train_idx[0]]} ~ {time_series[train_idx[-1]]}  共 {len(train_idx)} 条")
+   print(f"  验证集: {time_series[val_idx[0]]} ~ {time_series[val_idx[-1]]}  共 {len(val_idx)} 条")
+   print(f"  测试集: {time_series[test_idx[0]]} ~ {time_series[test_idx[-1]]}  共 {len(test_idx)} 条")
 
-   # === ramp loss sample weights（保持你原写法） ===
+   # ========= ramp 样本权重（只对【训练集】） =========
    ramp_flag_up_train = ramp_flag_up_seq[train_idx]
    ramp_flag_down_train = ramp_flag_down_seq[train_idx]
 
@@ -828,7 +1069,7 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
    y_val_lstm = y_seq[val_idx]
    y_test_lstm = y_seq[test_idx]
 
-   print("  → 训练 LSTM 偏差订正 ...")
+   print("  → 训练 LSTM 偏差订正模型（训练集早停 + 验证集监控 + 测试集只评估）...")
    model_lstm = Sequential()
    model_lstm.add(LSTM(LSTM_UNITS, input_shape=(WINDOW_SIZE, n_features_seq)))
    model_lstm.add(Dense(1))
@@ -853,7 +1094,7 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
    fc_lstm_eff = fc_seq - bias_pred_lstm_all
 
    # ========= Step 5: TCN =========
-   print("  → 训练 TCN 偏差订正 ...")
+   print("  → 训练 TCN 偏差订正模型（训练集早停 + 验证集监控 + 测试集只评估）...")
    model_tcn = build_tcn_model(
        WINDOW_SIZE,
        n_features=n_features_seq,
@@ -878,130 +1119,224 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
    ).ravel()
    fc_tcn_eff = fc_seq - bias_pred_tcn_all
 
-   # ========= Step 6: LightGBM =========
+   # ========= Step 6: LGBM =========
    X_train_lgb = X_lgb[train_idx]
    X_val_lgb = X_lgb[val_idx]
+   X_test_lgb = X_lgb[test_idx]
 
    y_train_lgb = bias_eff[train_idx]
    y_val_lgb = bias_eff[val_idx]
+   y_test_lgb = bias_eff[test_idx]
+   sample_weight_lgb = sample_weight_train
 
-   print("  → LightGBM 偏差订正 ...")
-   model_lgb = LGBMRegressor(
-       n_estimators=1200,
-       learning_rate=0.03,
-       num_leaves=63,
-       subsample=0.8,
-       colsample_bytree=0.8,
-       random_state=42,
-       verbosity=-1,
-   )
+   print("  → 训练 LightGBM 偏差订正模型（训练=2023，验证=2024-01~02，测试不参与）...")
+   lgb = LGBMRegressor(
+        n_estimators=1200,          # 多给一点上限
+        learning_rate=0.03,
+        num_leaves=63,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        max_depth=-1,
+        reg_alpha=0.5,
+        reg_lambda=0.5,
+        random_state=42,
+        verbosity=-1,
+    )
+   from lightgbm import early_stopping
+   lgb.fit(
+        X_train_lgb, y_train_lgb,
+        sample_weight=sample_weight_lgb,
+        eval_set=[(X_val_lgb, y_val_lgb)],
+        eval_metric="l2",
+        callbacks=[early_stopping(stopping_rounds=100)]   # ✔ 不会报错
+    )
 
-   model_lgb.fit(
-       X_train_lgb, y_train_lgb,
-       eval_set=[(X_val_lgb, y_val_lgb)],
-       eval_metric="l2",
-       sample_weight=sample_weight_train,
-       callbacks=[early_stopping(stopping_rounds=50)]
-   )
-
-   bias_hat_lgb = model_lgb.predict(X_lgb)
+   bias_hat_lgb = lgb.predict(X_lgb)
    fc_lgb_eff = fc_seq - bias_hat_lgb
 
-   # ========= Step 6.5: ramp skill（严格只用训练期）=========
-   print("  → 计算 ramp skill（仅训练期 2021-09~2022-04）")
-
+   # ========= Step 6.5: ramp skill =========
    ramp_skills = {}
-   ramp_skills["LSTM"] = compute_ramp_skill_lstm(fc_lstm_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH)
-   ramp_skills["TCN"]  = compute_ramp_skill_lstm(fc_tcn_eff,  obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH)
-   ramp_skills["LGBM"] = compute_ramp_skill_lstm(fc_lgb_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH)
-
+   print("  → 使用 3类 LSTM 学习各模型 ramp skill（只用 2023），用于动态融合加权...")
+   # 这里 test_start_time 传 TEST_START，仅用于保护 min(train_end, test_start)
+   ramp_skills["LSTM"] = compute_ramp_skill_lstm(
+       fc_lstm_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH
+   )
+   ramp_skills["TCN"] = compute_ramp_skill_lstm(
+       fc_tcn_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH
+   )
+   ramp_skills["LGBM"] = compute_ramp_skill_lstm(
+       fc_lgb_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH
+   )
    for k, v in ramp_skills.items():
-       print(f"    模型 {k} ramp-skill={v:.3f}")
+       print(f"    模型 {k} 的 ramp 识别准确率 = {v:.3f}")
 
-   # ========= Step 7: 多模型融合 =========
-   cand_list_1 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff]
-   w_hist_1, fc_fuse1_prior, _ = kalman_dynamic_fusion(
-       cand_list_1, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
-   )
-   fc_opt1 = fc_fuse1_prior
+   # ========= Step 7: 不同反馈延迟下，重新运行全部在线反馈模块 =========
+   delay_fusion_results = {}
 
-   cand_list_2 = [fc_kf_eff, fc_EMA_eff, fc_lgb_eff]
-   w_hist_2, fc_fuse2_prior, _ = kalman_dynamic_fusion(
-       cand_list_2, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
-   )
-   fc_opt2 = fc_fuse2_prior
-
-   cand_list_3 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff, fc_lgb_eff]
-   w_hist_3, fc_fuse3_prior, _ = kalman_dynamic_fusion(
-       cand_list_3, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
-   )
-   fc_opt3 = fc_fuse3_prior
-
-   cand_list_5 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff, fc_tcn_eff]
-   w_hist_5, fc_fuse5_prior, _ = kalman_dynamic_fusion(
-       cand_list_5, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
-   )
-   fc_opt5 = fc_fuse5_prior
-
-   # ========= Ramp 增强融合（保持你的结构）=========
    cand_names_4 = [
-       "KF","EMA","LSTM","TCN","LGBM",
-       "FUSE_KF_EMA_LSTM","FUSE_KF_EMA_LGBM",
-       "FUSE_KF_EMA_LSTM_LGBM","FUSE_KF_EMA_LSTM_TCN"
+       "KF",
+       "EMA",
+       "LSTM",
+       "TCN",
+       "LGBM",
+       "FUSE_KF_EMA_LSTM",
+       "FUSE_KF_EMA_LGBM",
+       "FUSE_KF_EMA_LSTM_LGBM",
+       "FUSE_KF_EMA_LSTM_TCN",
    ]
 
-   train_methods_sel = {
-       "KF": fc_kf_eff,
-       "EMA": fc_EMA_eff,
-       "LSTM": fc_lstm_eff,
-       "TCN": fc_tcn_eff,
-       "LGBM": fc_lgb_eff,
-       "FUSE_KF_EMA_LSTM": fc_opt1,
-       "FUSE_KF_EMA_LGBM": fc_opt2,
-       "FUSE_KF_EMA_LSTM_LGBM": fc_opt3,
-       "FUSE_KF_EMA_LSTM_TCN": fc_opt5,
-   }
-
-   cand_list_4 = [train_methods_sel[name] for name in cand_names_4]
-   name_to_idx = {name: i for i,name in enumerate(cand_names_4)}
+   name_to_idx = {name: i for i, name in enumerate(cand_names_4)}
 
    ramp_up_indices = []
+
    ramp_down_indices = []
-   calm_pref_indices = [name_to_idx["KF"]]
 
-   min_ramp_up_weight_indices = [name_to_idx["LSTM"]]
-   min_ramp_down_weight_indices = [name_to_idx["LSTM"], name_to_idx["LGBM"]]
+   calm_pref_indices = [
+       name_to_idx["FUSE_KF_EMA_LSTM"],
+   ]
 
-   # ramp flag from LSTM
-   ramp_flag_pred = np.zeros_like(fc_lstm_eff, dtype=int)
-   if len(fc_lstm_eff) > 1:
-       P_fc = windspeed_to_power(fc_lstm_eff)
-       P_obs_seq = windspeed_to_power(obs_seq)
-       diffP_pred = P_fc[1:] - P_obs_seq[:-1]
+   min_ramp_up_weight_indices = [
+       name_to_idx["LSTM"],
+   ]
 
-       up_mask = diffP_pred >= RAMP_TH
-       down_mask = diffP_pred <= -RAMP_TH
+   min_ramp_down_weight_indices = [
+       name_to_idx["LSTM"],
+       name_to_idx["LGBM"],
+   ]
 
-       ramp_flag_pred[1:][up_mask] = 1
-       ramp_flag_pred[1:][down_mask] = 2
+   for delay_steps in FEEDBACK_DELAYS:
+       print(f"  → 运行完整反馈延迟实验：delay = {delay_steps} time step(s)")
 
-   w_hist_4, fc_fuse4_prior, _ = kalman_dynamic_fusion(
-       cand_list_4, obs_seq,
-       q_w=FUSION_QW, r_w=FUSION_RW,
-       ramp_flags=ramp_flag_pred,
-       ramp_up_indices=ramp_up_indices,
-       ramp_down_indices=ramp_down_indices,
-       calm_pref_indices=calm_pref_indices,
-       ramp_up_boost_factor=RAMP_UP_BOOST_FACTOR,
-       ramp_down_boost_factor=RAMP_DOWN_BOOST_FACTOR,
-       calm_boost_factor=CALM_BOOST_FACTOR,
-       min_ramp_up_weight_indices=min_ramp_up_weight_indices,
-       min_ramp_down_weight_indices=min_ramp_down_weight_indices,
-       min_weight_up=0.9,
-       min_weight_down=0.45,
-   )
+       # delay 对应的小模型
+       fc_kf_d = fc_kf_eff_by_delay[delay_steps]
+       fc_EMA_d = fc_EMA_eff_by_delay[delay_steps]
 
-   fc_opt4 = fc_fuse4_prior
+       # LSTM / TCN / LGBM 在当前代码中不依赖运行期 obs，因此不延迟
+       fc_lstm_d = fc_lstm_eff
+       fc_tcn_d = fc_tcn_eff
+       fc_lgb_d = fc_lgb_eff
+
+       # ========= 常规中间融合 1 =========
+       cand_list_1_d = [fc_kf_d, fc_EMA_d, fc_lstm_d]
+       w_hist_1_d, fc_opt1_d, _ = kalman_dynamic_fusion(
+           cand_list_1_d,
+           obs_seq,
+           q_w=FUSION_QW,
+           r_w=FUSION_RW,
+           feedback_delay_steps=delay_steps
+       )
+
+       # ========= 常规中间融合 2 =========
+       cand_list_2_d = [fc_kf_d, fc_EMA_d, fc_lgb_d]
+       w_hist_2_d, fc_opt2_d, _ = kalman_dynamic_fusion(
+           cand_list_2_d,
+           obs_seq,
+           q_w=FUSION_QW,
+           r_w=FUSION_RW,
+           feedback_delay_steps=delay_steps
+       )
+
+       # ========= 常规中间融合 3 =========
+       cand_list_3_d = [fc_kf_d, fc_EMA_d, fc_lstm_d, fc_lgb_d]
+       w_hist_3_d, fc_opt3_d, _ = kalman_dynamic_fusion(
+           cand_list_3_d,
+           obs_seq,
+           q_w=FUSION_QW,
+           r_w=FUSION_RW,
+           feedback_delay_steps=delay_steps
+       )
+
+       # ========= 常规中间融合 5 =========
+       cand_list_5_d = [fc_kf_d, fc_EMA_d, fc_lstm_d, fc_tcn_d]
+       w_hist_5_d, fc_opt5_d, _ = kalman_dynamic_fusion(
+           cand_list_5_d,
+           obs_seq,
+           q_w=FUSION_QW,
+           r_w=FUSION_RW,
+           feedback_delay_steps=delay_steps
+       )
+
+       # ========= delay 对应的 ramp-aware 标签 =========
+       ramp_flag_pred_d = compute_ramp_flag_pred_delayed(
+           provisional_fc=fc_lstm_d,
+           obs_series=obs_seq,
+           ramp_th=RAMP_TH,
+           feedback_delay_steps=delay_steps
+       )
+
+       # ========= RAMP 增强融合候选模型 =========
+       train_methods_sel_d = {
+           "KF":                       fc_kf_d,
+           "EMA":                      fc_EMA_d,
+           "LSTM":                     fc_lstm_d,
+           "TCN":                      fc_tcn_d,
+           "LGBM":                     fc_lgb_d,
+           "FUSE_KF_EMA_LSTM":        fc_opt1_d,
+           "FUSE_KF_EMA_LGBM":        fc_opt2_d,
+           "FUSE_KF_EMA_LSTM_LGBM":   fc_opt3_d,
+           "FUSE_KF_EMA_LSTM_TCN":    fc_opt5_d,
+       }
+
+       cand_list_4_d = [train_methods_sel_d[name] for name in cand_names_4]
+
+       w_hist_4_d, fc_opt4_d, _ = kalman_dynamic_fusion(
+           cand_list_4_d,
+           obs_seq,
+           q_w=FUSION_QW,
+           r_w=FUSION_RW,
+           ramp_flags=ramp_flag_pred_d,
+           ramp_up_indices=ramp_up_indices,
+           ramp_down_indices=ramp_down_indices,
+           calm_pref_indices=calm_pref_indices,
+           ramp_up_boost_factor=RAMP_UP_BOOST_FACTOR,
+           ramp_down_boost_factor=RAMP_DOWN_BOOST_FACTOR,
+           calm_boost_factor=CALM_BOOST_FACTOR,
+           min_ramp_up_weight_indices=min_ramp_up_weight_indices,
+           min_ramp_down_weight_indices=min_ramp_down_weight_indices,
+           min_weight_up=0.9,
+           min_weight_down=0.45,
+           feedback_delay_steps=delay_steps
+       )
+
+       delay_fusion_results[delay_steps] = {
+           "fc_kf": fc_kf_d,
+           "fc_EMA": fc_EMA_d,
+           "fc_opt1": fc_opt1_d,
+           "fc_opt2": fc_opt2_d,
+           "fc_opt3": fc_opt3_d,
+           "fc_opt5": fc_opt5_d,
+           "fc_opt4": fc_opt4_d,
+           "w_hist_1": w_hist_1_d,
+           "w_hist_2": w_hist_2_d,
+           "w_hist_3": w_hist_3_d,
+           "w_hist_5": w_hist_5_d,
+           "w_hist_4": w_hist_4_d,
+           "ramp_flag_pred": ramp_flag_pred_d,
+       }
+
+   # ========= 保留 delay=0 的变量名，兼容后续原代码 =========
+   fc_kf_eff = delay_fusion_results[0]["fc_kf"]
+   fc_EMA_eff = delay_fusion_results[0]["fc_EMA"]
+
+   fc_opt1 = delay_fusion_results[0]["fc_opt1"]
+   fc_opt2 = delay_fusion_results[0]["fc_opt2"]
+   fc_opt3 = delay_fusion_results[0]["fc_opt3"]
+   fc_opt5 = delay_fusion_results[0]["fc_opt5"]
+   fc_opt4 = delay_fusion_results[0]["fc_opt4"]
+
+   w_hist_1 = delay_fusion_results[0]["w_hist_1"]
+   w_hist_2 = delay_fusion_results[0]["w_hist_2"]
+   w_hist_3 = delay_fusion_results[0]["w_hist_3"]
+   w_hist_5 = delay_fusion_results[0]["w_hist_5"]
+   w_hist_4 = delay_fusion_results[0]["w_hist_4"]
+
+   ramp_flag_pred = delay_fusion_results[0]["ramp_flag_pred"]
+
+   # ========= delay=1 / delay=2 的最终方案 =========
+   fc_opt4_delay1 = delay_fusion_results[1]["fc_opt4"]
+   fc_opt4_delay2 = delay_fusion_results[2]["fc_opt4"]
+
+   print("  用于 RAMP 增强融合的固定候选模型：", ", ".join(cand_names_4))
 
    print("  动态融合1(KF+EMA+LSTM) 平均权重：", ", ".join(f"{w:.3f}" for w in w_hist_1.mean(axis=0)))
    print("  动态融合2(KF+EMA+LGBM) 平均权重：", ", ".join(f"{w:.3f}" for w in w_hist_2.mean(axis=0)))
@@ -1017,6 +1352,7 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        fusion_name="FUSE_RAMP_ENHANCED"
    )
 
+
    # ========= Step 7.9: 汇总各方案 =========
    methods = {
        "RAW":                       fc_RAW_eff,
@@ -1029,8 +1365,15 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "FUSE_KF_EMA_LGBM":         fc_opt2,
        "FUSE_KF_EMA_LSTM_LGBM":    fc_opt3,
        "FUSE_KF_EMA_LSTM_TCN":     fc_opt5,
-       "FUSE_RAMP_ENHANCED":       fc_opt4,
+
+       # 原始无延迟版本
+       "FUSE_RAMP_ENHANCED":        fc_opt4,
+
+       # 新增：反馈延迟版本
+       "FUSE_RAMP_DELAY_1STEP":     fc_opt4_delay1,
+       "FUSE_RAMP_DELAY_2STEP":     fc_opt4_delay2,
    }
+
 
    obs_test = obs_seq[test_idx]
    RAW_test = fc_RAW_eff[test_idx]
@@ -1055,6 +1398,8 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "TCN",
        "LGBM",
        "FUSE_RAMP_ENHANCED",
+       "FUSE_RAMP_DELAY_1STEP",
+       "FUSE_RAMP_DELAY_2STEP",
    ]
 
    from math import ceil
@@ -1086,6 +1431,64 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
            f"Acc={m['acc']:.3f}  Macro(P/R/F1)=({m['macro_p']:.3f}/{m['macro_r']:.3f}/{m['macro_f1']:.3f})  "
            f"Up(P/R/F1)=({m['p1']:.3f}/{m['r1']:.3f}/{m['f11']:.3f})  "
            f"Down(P/R/F1)=({m['p2']:.3f}/{m['r2']:.3f}/{m['f12']:.3f})"
+       )
+
+   # ========= Step 8.6: 反馈延迟敏感性指标 =========
+   delay_rows_this_lead = []
+
+   base_fc_delay0 = delay_fusion_results[0]["fc_opt4"]
+   base_mae, _, base_rmse = calc_stats(base_fc_delay0[test_idx], obs_test)
+   base_ramp_acc = compute_ramp_accuracy(base_fc_delay0[test_idx], obs_test, RAMP_TH)
+   base_y_pred = compute_ramp_label_3class(base_fc_delay0[test_idx], RAMP_TH)
+   base_multi = compute_multi_metrics(y_true, base_y_pred)
+   base_macro_f1 = base_multi["macro_f1"]
+
+   print(f"\n  [反馈延迟敏感性 | Lead={lead_hour}h | FUSE_RAMP_ENHANCED]")
+   for delay_steps in FEEDBACK_DELAYS:
+       fc_delay = delay_fusion_results[delay_steps]["fc_opt4"]
+
+       mae_d, _, rmse_d = calc_stats(fc_delay[test_idx], obs_test)
+       corr_d = calc_corr(fc_delay[test_idx], obs_test)
+       ramp_acc_d = compute_ramp_accuracy(fc_delay[test_idx], obs_test, RAMP_TH)
+
+       y_pred_d = compute_ramp_label_3class(fc_delay[test_idx], RAMP_TH)
+       multi_d = compute_multi_metrics(y_true, y_pred_d)
+
+       rmse_deg_pct = (rmse_d / base_rmse - 1.0) * 100.0 if base_rmse > 0 else np.nan
+       mae_deg_pct = (mae_d / base_mae - 1.0) * 100.0 if base_mae > 0 else np.nan
+       ramp_acc_change = ramp_acc_d - base_ramp_acc
+       macro_f1_change = multi_d["macro_f1"] - base_macro_f1
+
+       row_delay = {
+           "Lead_h": lead_hour,
+           "Feedback_Delay_Steps": delay_steps,
+           "MAE": mae_d,
+           "RMSE": rmse_d,
+           "Corr": corr_d,
+           "RampAcc": ramp_acc_d,
+           "Macro_P": multi_d["macro_p"],
+           "Macro_R": multi_d["macro_r"],
+           "Macro_F1": multi_d["macro_f1"],
+           "P_RampUp": multi_d["p1"],
+           "R_RampUp": multi_d["r1"],
+           "F1_RampUp": multi_d["f11"],
+           "P_RampDown": multi_d["p2"],
+           "R_RampDown": multi_d["r2"],
+           "F1_RampDown": multi_d["f12"],
+           "RMSE_Degradation_pct_vs_D0": rmse_deg_pct,
+           "MAE_Degradation_pct_vs_D0": mae_deg_pct,
+           "RampAcc_Change_vs_D0": ramp_acc_change,
+           "Macro_F1_Change_vs_D0": macro_f1_change,
+       }
+
+       delay_rows_this_lead.append(row_delay)
+       delay_sensitivity_rows.append(row_delay)
+
+       print(
+           f"    Delay={delay_steps} step(s): "
+           f"RMSE={rmse_d:.3f}, MAE={mae_d:.3f}, Corr={corr_d:.3f}, "
+           f"RampAcc={ramp_acc_d:.3f}, MacroF1={multi_d['macro_f1']:.3f}, "
+           f"RMSE退化={rmse_deg_pct:.2f}%"
        )
 
    if cm_dict:
@@ -1166,7 +1569,7 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        cbar.ax.tick_params(labelsize=18)
 
        out_cm_all_name = f"Ramp_CM_Lead_{lead_hour}h_ALL_MODELS.png"
-       ##save_png_and_eps(out_cm_all_name, dpi=350, fig=fig)
+       save_png_and_eps(out_cm_all_name, dpi=350, fig=fig)
 
        ##plt.show()
        plt.close(fig)
@@ -1253,8 +1656,15 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "Fcst_FUSE_KF_EMA_LGBM":        fc_opt2,
        "Fcst_FUSE_KF_EMA_LSTM_LGBM":   fc_opt3,
        "Fcst_FUSE_KF_EMA_LSTM_TCN":    fc_opt5,
-       "Fcst_FUSE_RAMP_ENHANCED":      fc_opt4,
+
+       # 原始无延迟
+       "Fcst_FUSE_RAMP_ENHANCED_D0":   fc_opt4,
+
+       # 反馈延迟 1 / 2 个时间步
+       "Fcst_FUSE_RAMP_ENHANCED_D1":   fc_opt4_delay1,
+       "Fcst_FUSE_RAMP_ENHANCED_D2":   fc_opt4_delay2,
    })
+
 
    out_df["is_train"] = 0
    out_df["is_val"] = 0
@@ -1288,6 +1698,12 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
            })
        metrics_df = pd.DataFrame(metrics_rows)
        metrics_df.to_excel(writer, sheet_name="RampMetrics_TEST", index=False)
+       pd.DataFrame(delay_rows_this_lead).to_excel(
+           writer,
+           sheet_name="DelayFeedback_TEST",
+           index=False
+       )
+
 
    print(f"  → 已保存 Excel：{out_name}")
 
@@ -1306,6 +1722,8 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "RMSE_FUSE_KF_EMA_LSTM_LGBM":   stats_test["FUSE_KF_EMA_LSTM_LGBM"][1],
        "RMSE_FUSE_KF_EMA_LSTM_TCN":    stats_test["FUSE_KF_EMA_LSTM_TCN"][1],
        "RMSE_FUSE_RAMP_ENHANCED":      stats_test["FUSE_RAMP_ENHANCED"][1],
+       "RMSE_FUSE_RAMP_DELAY_1STEP":   stats_test["FUSE_RAMP_DELAY_1STEP"][1],
+       "RMSE_FUSE_RAMP_DELAY_2STEP":   stats_test["FUSE_RAMP_DELAY_2STEP"][1],
 
        "MAE_RAW":  stats_test["RAW"][0],
        "MAE_KF":   stats_test["KF"][0],
@@ -1318,6 +1736,8 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "MAE_FUSE_KF_EMA_LSTM_LGBM":   stats_test["FUSE_KF_EMA_LSTM_LGBM"][0],
        "MAE_FUSE_KF_EMA_LSTM_TCN":    stats_test["FUSE_KF_EMA_LSTM_TCN"][0],
        "MAE_FUSE_RAMP_ENHANCED":      stats_test["FUSE_RAMP_ENHANCED"][0],
+       "MAE_FUSE_RAMP_DELAY_1STEP":    stats_test["FUSE_RAMP_DELAY_1STEP"][0],
+       "MAE_FUSE_RAMP_DELAY_2STEP":    stats_test["FUSE_RAMP_DELAY_2STEP"][0],
 
        "Corr_RAW":  stats_test["RAW"][2],
        "Corr_KF":   stats_test["KF"][2],
@@ -1330,6 +1750,8 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "Corr_FUSE_KF_EMA_LSTM_LGBM":   stats_test["FUSE_KF_EMA_LSTM_LGBM"][2],
        "Corr_FUSE_KF_EMA_LSTM_TCN":    stats_test["FUSE_KF_EMA_LSTM_TCN"][2],
        "Corr_FUSE_RAMP_ENHANCED":      stats_test["FUSE_RAMP_ENHANCED"][2],
+       "Corr_FUSE_RAMP_DELAY_1STEP":   stats_test["FUSE_RAMP_DELAY_1STEP"][2],
+       "Corr_FUSE_RAMP_DELAY_2STEP":   stats_test["FUSE_RAMP_DELAY_2STEP"][2],
 
        "RampAcc_RAW":                  ramp_acc_test["RAW"],
        "RampAcc_KF":                   ramp_acc_test["KF"],
@@ -1342,6 +1764,9 @@ for lead_code, (fcst_file, obs_file) in pairs.items():
        "RampAcc_FUSE_KF_EMA_LSTM_LGBM": ramp_acc_test["FUSE_KF_EMA_LSTM_LGBM"],
        "RampAcc_FUSE_KF_EMA_LSTM_TCN":  ramp_acc_test["FUSE_KF_EMA_LSTM_TCN"],
        "RampAcc_FUSE_RAMP_ENHANCED":   ramp_acc_test["FUSE_RAMP_ENHANCED"],
+       "RampAcc_FUSE_RAMP_DELAY_1STEP": ramp_acc_test["FUSE_RAMP_DELAY_1STEP"],
+       "RampAcc_FUSE_RAMP_DELAY_2STEP": ramp_acc_test["FUSE_RAMP_DELAY_2STEP"],
+
    }
 
    summary_rows.append(row)
@@ -1586,6 +2011,71 @@ if ramp_metrics_summary_rows:
     )
     print("\n=== Lead-wise Ramp Classification Metrics (Acc / Macro P-R-F1 / Per-Class P-R-F1) ===")
     print(metrics_summary_df)
+
+# ===============================================================
+#        Delayed Feedback Sensitivity Summary
+# ===============================================================
+if delay_sensitivity_rows:
+    delay_summary_df = pd.DataFrame(delay_sensitivity_rows)
+    delay_summary_df = delay_summary_df.sort_values(["Lead_h", "Feedback_Delay_Steps"])
+
+    delay_summary_df.to_excel(
+        "FUSE_RAMP_ENHANCED_DelayedFeedback_Sensitivity_Summary.xlsx",
+        index=False
+    )
+
+    print("\n=== Delayed Feedback Sensitivity Summary ===")
+    print(delay_summary_df)
+
+    # 画 RMSE 随 lead 和 delay 的变化
+    plt.figure(figsize=(6.0, 4.2))
+
+    for delay_steps in FEEDBACK_DELAYS:
+        sub = delay_summary_df[delay_summary_df["Feedback_Delay_Steps"] == delay_steps]
+        plt.plot(
+            sub["Lead_h"].values,
+            sub["RMSE"].values,
+            marker="o",
+            linewidth=1.8,
+            label=f"Delay={delay_steps} step(s)"
+        )
+
+    plt.xlabel("Lead Time (h)")
+    plt.ylabel("RMSE (m/s)")
+    plt.title("Delayed Feedback Sensitivity of FUSE_RAMP_ENHANCED")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_png_and_eps(
+        "FUSE_RAMP_ENHANCED_DelayedFeedback_RMSE_vs_Lead.png",
+        dpi=600
+    )
+
+    # 画 Macro-F1 随 lead 和 delay 的变化
+    plt.figure(figsize=(6.0, 4.2))
+
+    for delay_steps in FEEDBACK_DELAYS:
+        sub = delay_summary_df[delay_summary_df["Feedback_Delay_Steps"] == delay_steps]
+        plt.plot(
+            sub["Lead_h"].values,
+            sub["Macro_F1"].values,
+            marker="s",
+            linewidth=1.8,
+            label=f"Delay={delay_steps} step(s)"
+        )
+
+    plt.xlabel("Lead Time (h)")
+    plt.ylabel("Macro-F1")
+    plt.title("Delayed Feedback Sensitivity of Ramp Classification")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_png_and_eps(
+        "FUSE_RAMP_ENHANCED_DelayedFeedback_MacroF1_vs_Lead.png",
+        dpi=600
+    )
 
 plt.show()
 print("\nAll figures generated successfully. ✅")
