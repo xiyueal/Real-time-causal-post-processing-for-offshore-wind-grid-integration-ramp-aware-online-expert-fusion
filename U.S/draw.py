@@ -117,6 +117,71 @@ def plot_grouped_bar_on_ax1(ax, sub_df, metric_cols, metric_labels,
     # Auto-adjust y-axis
     auto_adjust_ylim(ax)
 
+
+# ======================
+#   Export results to Excel
+# ======================
+
+export_file = "RampMetrics_Result_Export.xlsx"
+
+metric_cols_all = [
+    "Acc", "Macro_P", "Macro_R", "Macro_F1",
+    "P_NoRamp", "P_RampUp", "P_RampDown",
+    "R_NoRamp", "R_RampUp", "R_RampDown",
+    "F1_NoRamp", "F1_RampUp", "F1_RampDown"
+]
+
+# 按固定方案顺序排序
+export_df = df.copy()
+export_df["scheme_rank"] = export_df["方案"].apply(
+    lambda x: scheme_order.index(x) if x in scheme_order else 999
+)
+export_df = export_df.sort_values(["Lead_h", "scheme_rank"]).drop(columns="scheme_rank")
+
+with pd.ExcelWriter(export_file, engine="openpyxl") as writer:
+
+    # 1. 导出总表
+    export_df.to_excel(writer, sheet_name="All_results", index=False)
+
+    # 2. 按 lead 分 sheet 导出
+    for lead in leads:
+        sub = export_df[export_df["Lead_h"] == lead].copy()
+
+        sheet_name = f"Lead_{lead}h"
+        sheet_name = sheet_name.replace(".", "_")[:31]  # Excel sheet 名最长 31 个字符
+
+        sub.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    # 3. 每个 lead、每个指标的最优方案
+    best_rows = []
+
+    for lead in leads:
+        sub = export_df[export_df["Lead_h"] == lead].copy()
+
+        for metric in metric_cols_all:
+            if metric not in sub.columns:
+                continue
+
+            tmp = sub[["方案", metric]].dropna()
+
+            if tmp.empty:
+                continue
+
+            best_idx = tmp[metric].idxmax()
+
+            best_rows.append({
+                "Lead_h": lead,
+                "Metric": metric,
+                "Best_scheme": export_df.loc[best_idx, "方案"],
+                "Best_value": export_df.loc[best_idx, metric]
+            })
+
+    best_df = pd.DataFrame(best_rows)
+    best_df.to_excel(writer, sheet_name="Best_by_metric", index=False)
+
+print(f"Excel results exported to: {export_file}")
+
+
 # ======================
 #   Plot loop
 # ======================

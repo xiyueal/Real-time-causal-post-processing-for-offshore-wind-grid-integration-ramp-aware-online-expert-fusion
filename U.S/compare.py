@@ -41,7 +41,11 @@ TEST_END    = pd.Timestamp("2024-12-31 23:59:59")
 # 只用 2023-2024 两年（建议强制过滤）
 DATA_START  = TRAIN_START
 DATA_END    = TEST_END
+RAMP_GROUP_MIN_UP_GRID = np.round(np.arange(0.0, 0.81, 0.10), 2)
+RAMP_GROUP_MIN_DOWN_GRID = np.round(np.arange(0.0, 0.81, 0.10), 2)
 
+# RMSE 约束：Event-F1 提升时，验证集 RMSE 不应比无组权重约束方案明显变差
+RAMP_GROUP_MIN_RMSE_TOLERANCE = 0.03
 
 # ==============================
 # 通用图片保存函数：PNG + EPS
@@ -184,6 +188,406 @@ def compute_multi_metrics(y_true, y_pred):
        "p2": p2, "r2": r2, "f12": f12,
    }
 
+def compute_event_f1(fc_series, obs_series, ramp_th):
+   """
+   计算 Ramp-Up 和 Ramp-Down 两类事件的平均 F1。
+   该指标避免 No-Ramp 样本过多导致 Accuracy 偏高。
+   """
+   y_true = compute_ramp_label_3class(obs_series, ramp_th)
+   y_pred = compute_ramp_label_3class(fc_series, ramp_th)
+
+   m = compute_multi_metrics(y_true, y_pred)
+
+   event_f1 = 0.5 * (m["f11"] + m["f12"])
+
+   return event_f1, m
+
+
+def select_ramp_fusion_qr_minweight_by_validation(
+   fc_list,
+   obs,
+   val_mask_or_idx,
+   q_grid,
+   r_grid,
+   ramp_flags,
+   ramp_up_indices,
+   ramp_down_indices,
+   calm_pref_indices,
+   ramp_up_boost_factor,
+   ramp_down_boost_factor,
+   calm_boost_factor,
+   min_ramp_up_weight_indices,
+   min_ramp_down_weight_indices,
+   ramp_th,
+   min_up_grid=None,
+   min_down_grid=None,
+   rmse_tolerance=0.03,
+):
+   """
+   对 RAMP 增强融合进行联合验证集调优：
+   1. q_w
+   2. r_w
+   3. min_weight_up
+   4. min_weight_down
+
+   选择原则：
+   - 主指标：Ramp-Up 和 Ramp-Down 的平均 F1，即 Event_F1；
+   - 约束：验证集 RMSE 不超过无最小权重约束方案的指定比例；
+   - 若 Event_F1 相同，则优先选择 Macro_F1 高、RMSE 低、最小权重更小的方案。
+   """
+
+   if min_up_grid is None:
+       min_up_grid = np.round(np.arange(0.01, 0.30, 0.03), 2)
+
+   if min_down_grid is None:
+       min_down_grid = np.round(np.arange(0.01, 0.30, 0.03), 2)
+
+   obs = np.asarray(obs, dtype=float)
+   val_idx_local = _to_index_array(val_mask_or_idx)
+
+   # 为避免任何测试期信息进入调参，只运行到验证集结束
+   end_pos = int(val_idx_local.max()) + 1
+
+   fc_prefix = [np.asarray(x[:end_pos], dtype=float) for x in fc_list]
+   obs_prefix = obs[:end_pos]
+   ramp_prefix = np.asarray(ramp_flags[:end_pos], dtype=int)
+
+   obs_val = obs[val_idx_local]
+
+   rows = []
+   best_q = None
+   best_r = None
+   best_min_up = None
+   best_min_down = None
+
+   for min_up in min_up_grid:
+
+       # 可行性约束：被强制的最小权重总和不能超过 1
+       if min_ramp_up_weight_indices:
+           if len(min_ramp_up_weight_indices) * min_up > 1.0:
+               continue
+
+       for min_down in min_down_grid:
+
+           if min_ramp_down_weight_indices:
+               if len(min_ramp_down_weight_indices) * min_down > 1.0:
+                   continue
+
+           for q in q_grid:
+               for r in r_grid:
+
+                   try:
+                       w_hist_tmp, fc_prior_tmp, _ = kalman_dynamic_fusion(
+                           fc_prefix,
+                           obs_prefix,
+                           q_w=float(q),
+                           r_w=float(r),
+                           ramp_flags=ramp_prefix,
+                           ramp_up_indices=ramp_up_indices,
+                           ramp_down_indices=ramp_down_indices,
+                           calm_pref_indices=calm_pref_indices,
+                           ramp_up_boost_factor=ramp_up_boost_factor,
+                           ramp_down_boost_factor=ramp_down_boost_factor,
+                           calm_boost_factor=calm_boost_factor,
+                           min_ramp_up_weight_indices=min_ramp_up_weight_indices,
+                           min_ramp_down_weight_indices=min_ramp_down_weight_indices,
+                           min_weight_up=float(min_up),
+                           min_weight_down=float(min_down),
+                       )
+
+                       fc_val = fc_prior_tmp[val_idx_local]
+
+                       mae, mse, rmse = calc_stats(fc_val, obs_val)
+                       corr = calc_corr(fc_val, obs_val)
+
+                       event_f1, m = compute_event_f1(fc_val, obs_val, ramp_th)
+
+                       rows.append({
+                           "Q": float(q),
+                           "R": float(r),
+                           "min_weight_up": float(min_up),
+                           "min_weight_down": float(min_down),
+                           "Val_MAE": float(mae),
+                           "Val_RMSE": float(rmse),
+                           "Val_Corr": float(corr),
+                           "Val_Acc": float(m["acc"]),
+                           "Val_Macro_P": float(m["macro_p"]),
+                           "Val_Macro_R": float(m["macro_r"]),
+                           "Val_Macro_F1": float(m["macro_f1"]),
+                           "Val_F1_RampUp": float(m["f11"]),
+                           "Val_F1_RampDown": float(m["f12"]),
+                           "Val_Event_F1": float(event_f1),
+                           "Weight_Penalty": float(min_up + min_down),
+                       })
+
+                   except Exception as e:
+                       rows.append({
+                           "Q": float(q),
+                           "R": float(r),
+                           "min_weight_up": float(min_up),
+                           "min_weight_down": float(min_down),
+                           "Val_MAE": np.nan,
+                           "Val_RMSE": np.nan,
+                           "Val_Corr": np.nan,
+                           "Val_Acc": np.nan,
+                           "Val_Macro_P": np.nan,
+                           "Val_Macro_R": np.nan,
+                           "Val_Macro_F1": np.nan,
+                           "Val_F1_RampUp": np.nan,
+                           "Val_F1_RampDown": np.nan,
+                           "Val_Event_F1": np.nan,
+                           "Weight_Penalty": float(min_up + min_down),
+                           "Error": str(e),
+                       })
+
+   tuning_df = pd.DataFrame(rows)
+
+   valid_df = tuning_df.dropna(subset=["Val_RMSE", "Val_Event_F1"]).copy()
+
+   if valid_df.empty:
+       raise ValueError("RAMP 增强融合最小权重调参失败：没有有效候选结果。")
+
+   # 无最小权重约束的基准 RMSE
+   base_df = valid_df[
+       (valid_df["min_weight_up"] == 0.0) &
+       (valid_df["min_weight_down"] == 0.0)
+   ].copy()
+
+   if len(base_df) > 0:
+       base_rmse = base_df["Val_RMSE"].min()
+       rmse_limit = base_rmse * (1.0 + rmse_tolerance)
+       feasible_df = valid_df[valid_df["Val_RMSE"] <= rmse_limit].copy()
+
+       if feasible_df.empty:
+           feasible_df = valid_df.copy()
+   else:
+       feasible_df = valid_df.copy()
+
+   # 选择规则：
+   # 1. Event_F1 越高越好
+   # 2. Macro_F1 越高越好
+   # 3. RMSE 越低越好
+   # 4. 权重约束越小越好，避免过强的人为约束
+   feasible_df = feasible_df.sort_values(
+       ["Val_Event_F1", "Val_Macro_F1", "Val_RMSE", "Weight_Penalty"],
+       ascending=[False, False, True, True]
+   ).reset_index(drop=True)
+
+   best_row = feasible_df.iloc[0].to_dict()
+
+   best_q = float(best_row["Q"])
+   best_r = float(best_row["R"])
+   best_min_up = float(best_row["min_weight_up"])
+   best_min_down = float(best_row["min_weight_down"])
+
+   tuning_df["Selected"] = (
+       (tuning_df["Q"] == best_q) &
+       (tuning_df["R"] == best_r) &
+       (tuning_df["min_weight_up"] == best_min_up) &
+       (tuning_df["min_weight_down"] == best_min_down)
+   )
+
+   return best_q, best_r, best_min_up, best_min_down, tuning_df, best_row
+
+def compute_event_f1(fc_series, obs_series, ramp_th):
+   """
+   Ramp-Up 和 Ramp-Down 两类事件的平均 F1。
+   """
+   y_true = compute_ramp_label_3class(obs_series, ramp_th)
+   y_pred = compute_ramp_label_3class(fc_series, ramp_th)
+
+   m = compute_multi_metrics(y_true, y_pred)
+   event_f1 = 0.5 * (m["f11"] + m["f12"])
+
+   return event_f1, m
+
+
+def select_ramp_fusion_qr_groupmin_by_validation(
+   fc_list,
+   obs,
+   val_mask_or_idx,
+   q_grid,
+   r_grid,
+   ramp_flags,
+   ramp_up_indices,
+   ramp_down_indices,
+   calm_pref_indices,
+   ramp_up_boost_factor,
+   ramp_down_boost_factor,
+   calm_boost_factor,
+   min_ramp_up_weight_indices,
+   min_ramp_down_weight_indices,
+   ramp_skill_weights,
+   ramp_th,
+   min_up_grid,
+   min_down_grid,
+   rmse_tolerance=0.03,
+):
+   """
+   对 FUSE_RAMP_ENHANCED 进行联合验证集调优：
+
+   1. q_w
+   2. r_w
+   3. min_weight_up   —— 突增时 ramp 模型组总权重下限
+   4. min_weight_down —— 突减时 ramp 模型组总权重下限
+
+   选择原则：
+   - 主指标：Val_Event_F1 = 0.5 * (F1_RampUp + F1_RampDown)
+   - 约束：Val_RMSE 不超过无组权重下限方案的 3%
+   - 若多个方案满足，则优先 Macro_F1 高、RMSE 低、组约束较弱的方案
+   """
+
+   obs = np.asarray(obs, dtype=float)
+   val_idx_local = _to_index_array(val_mask_or_idx)
+
+   # 只运行到验证集结束，避免调参阶段接触测试期
+   end_pos = int(val_idx_local.max()) + 1
+
+   fc_prefix = [np.asarray(x[:end_pos], dtype=float) for x in fc_list]
+   obs_prefix = obs[:end_pos]
+   ramp_prefix = np.asarray(ramp_flags[:end_pos], dtype=int)
+
+   obs_val = obs[val_idx_local]
+
+   rows = []
+
+   for min_up in min_up_grid:
+       min_up = float(min_up)
+
+       if min_up < 0 or min_up >= 1.0:
+           continue
+
+       for min_down in min_down_grid:
+           min_down = float(min_down)
+
+           if min_down < 0 or min_down >= 1.0:
+               continue
+
+           for q in q_grid:
+               for r in r_grid:
+
+                   try:
+                       w_hist_tmp, fc_prior_tmp, _ = kalman_dynamic_fusion(
+                           fc_prefix,
+                           obs_prefix,
+                           q_w=float(q),
+                           r_w=float(r),
+
+                           ramp_flags=ramp_prefix,
+                           ramp_up_indices=ramp_up_indices,
+                           ramp_down_indices=ramp_down_indices,
+                           calm_pref_indices=calm_pref_indices,
+                           ramp_up_boost_factor=ramp_up_boost_factor,
+                           ramp_down_boost_factor=ramp_down_boost_factor,
+                           calm_boost_factor=calm_boost_factor,
+
+                           min_ramp_up_weight_indices=min_ramp_up_weight_indices,
+                           min_ramp_down_weight_indices=min_ramp_down_weight_indices,
+
+                           # 这里是组总权重下限，不是单模型下限
+                           min_weight_up=min_up,
+                           min_weight_down=min_down,
+
+                           ramp_skill_weights=ramp_skill_weights,
+                           use_ramp_skill=True,
+                           ramp_skill_flags=(1, 2),
+
+                           # 关键：启用组权重下限模式
+                           use_group_min_weight=True,
+                       )
+
+                       fc_val = fc_prior_tmp[val_idx_local]
+
+                       mae, mse, rmse = calc_stats(fc_val, obs_val)
+                       corr = calc_corr(fc_val, obs_val)
+
+                       event_f1, m = compute_event_f1(fc_val, obs_val, ramp_th)
+
+                       rows.append({
+                           "Q": float(q),
+                           "R": float(r),
+                           "min_weight_up": min_up,
+                           "min_weight_down": min_down,
+                           "Val_MAE": float(mae),
+                           "Val_RMSE": float(rmse),
+                           "Val_Corr": float(corr),
+                           "Val_Acc": float(m["acc"]),
+                           "Val_Macro_P": float(m["macro_p"]),
+                           "Val_Macro_R": float(m["macro_r"]),
+                           "Val_Macro_F1": float(m["macro_f1"]),
+                           "Val_F1_RampUp": float(m["f11"]),
+                           "Val_F1_RampDown": float(m["f12"]),
+                           "Val_Event_F1": float(event_f1),
+                           "Group_MinWeight_Sum": float(min_up + min_down),
+                       })
+
+                   except Exception as e:
+                       rows.append({
+                           "Q": float(q),
+                           "R": float(r),
+                           "min_weight_up": min_up,
+                           "min_weight_down": min_down,
+                           "Val_MAE": np.nan,
+                           "Val_RMSE": np.nan,
+                           "Val_Corr": np.nan,
+                           "Val_Acc": np.nan,
+                           "Val_Macro_P": np.nan,
+                           "Val_Macro_R": np.nan,
+                           "Val_Macro_F1": np.nan,
+                           "Val_F1_RampUp": np.nan,
+                           "Val_F1_RampDown": np.nan,
+                           "Val_Event_F1": np.nan,
+                           "Group_MinWeight_Sum": float(min_up + min_down),
+                           "Error": str(e),
+                       })
+
+   tuning_df = pd.DataFrame(rows)
+
+   valid_df = tuning_df.dropna(
+       subset=["Val_RMSE", "Val_Event_F1"]
+   ).copy()
+
+   if valid_df.empty:
+       raise ValueError("FUSE_RAMP_ENHANCED 组权重下限调参失败：没有有效候选结果。")
+
+   # 无组权重下限基准：min_weight_up=0 且 min_weight_down=0
+   base_df = valid_df[
+       (valid_df["min_weight_up"] == 0.0) &
+       (valid_df["min_weight_down"] == 0.0)
+   ].copy()
+
+   if len(base_df) > 0:
+       base_rmse = float(base_df["Val_RMSE"].min())
+       rmse_limit = base_rmse * (1.0 + rmse_tolerance)
+
+       feasible_df = valid_df[valid_df["Val_RMSE"] <= rmse_limit].copy()
+
+       if feasible_df.empty:
+           feasible_df = valid_df.copy()
+   else:
+       feasible_df = valid_df.copy()
+
+   feasible_df = feasible_df.sort_values(
+       ["Val_Event_F1", "Val_Macro_F1", "Val_RMSE", "Group_MinWeight_Sum"],
+       ascending=[False, False, True, True]
+   ).reset_index(drop=True)
+
+   best_row = feasible_df.iloc[0].to_dict()
+
+   best_q = float(best_row["Q"])
+   best_r = float(best_row["R"])
+   best_min_up = float(best_row["min_weight_up"])
+   best_min_down = float(best_row["min_weight_down"])
+
+   tuning_df["Selected"] = (
+       (tuning_df["Q"] == best_q) &
+       (tuning_df["R"] == best_r) &
+       (tuning_df["min_weight_up"] == best_min_up) &
+       (tuning_df["min_weight_down"] == best_min_down)
+   )
+
+   return best_q, best_r, best_min_up, best_min_down, tuning_df, best_row
+
 
 def plot_ramp_confusion_matrix(y_true, y_pred, title, save_name):
    labels = [0, 1, 2]
@@ -303,20 +707,194 @@ def compute_ramp_accuracy(fc_series, obs_series, ramp_th):
        return np.nan
    return float((ramp_obs == ramp_fc).mean())
 
+def make_adaptive_r_grid(residual, multipliers, min_r=1e-8):
+   """
+   根据训练集残差方差自动生成 R 候选集合。
+   这样不同风电场、不同 lead 的误差尺度不同，R 也会自适应变化。
+   """
+   residual = np.asarray(residual, dtype=float)
+   residual = residual[np.isfinite(residual)]
+
+   if len(residual) < 5:
+       base_r = 1.0
+   else:
+       base_r = float(np.var(residual))
+
+   if (not np.isfinite(base_r)) or base_r <= min_r:
+       base_r = 1.0
+
+   grid = base_r * np.asarray(multipliers, dtype=float)
+   grid = np.maximum(grid, min_r)
+   grid = np.unique(np.sort(grid))
+
+   return grid
+
+
+def _to_index_array(mask_or_idx):
+   arr = np.asarray(mask_or_idx)
+   if arr.dtype == bool:
+       return np.where(arr)[0]
+   return arr.astype(int)
+
+
+def select_kf_qr_by_validation(
+   yt,
+   Zt,
+   fc,
+   obs,
+   val_mask_or_idx,
+   q_grid,
+   r_grid,
+):
+   """
+   为 kalman_regression 选择 Q/R。
+   选择标准：验证集 RMSE 最小。
+   """
+   val_idx_local = _to_index_array(val_mask_or_idx)
+
+   rows = []
+   best_score = np.inf
+   best_q = None
+   best_r = None
+
+   for q in q_grid:
+       for r in r_grid:
+           try:
+               _, bias_pred, _ = kalman_regression(
+                   yt,
+                   Zt,
+                   q=float(q),
+                   r=float(r)
+               )
+
+               fc_corr = np.asarray(fc, dtype=float) - bias_pred
+
+               mae, mse, rmse = calc_stats(
+                   fc_corr[val_idx_local],
+                   np.asarray(obs, dtype=float)[val_idx_local]
+               )
+
+               row = {
+                   "Q": float(q),
+                   "R": float(r),
+                   "Val_MAE": float(mae),
+                   "Val_RMSE": float(rmse),
+               }
+               rows.append(row)
+
+               if rmse < best_score:
+                   best_score = rmse
+                   best_q = float(q)
+                   best_r = float(r)
+
+           except Exception as e:
+               rows.append({
+                   "Q": float(q),
+                   "R": float(r),
+                   "Val_MAE": np.nan,
+                   "Val_RMSE": np.nan,
+                   "Error": str(e),
+               })
+
+   tuning_df = pd.DataFrame(rows)
+   tuning_df["Selected"] = (
+       (tuning_df["Q"] == best_q) &
+       (tuning_df["R"] == best_r)
+   )
+
+   best_row = tuning_df[tuning_df["Selected"]].iloc[0].to_dict()
+
+   return best_q, best_r, tuning_df, best_row
+
+
+def select_fusion_qr_by_validation(
+   fc_list,
+   obs,
+   val_mask_or_idx,
+   q_grid,
+   r_grid,
+   fusion_kwargs=None,
+):
+   """
+   为 kalman_dynamic_fusion 选择 Q/R。
+   选择标准：验证集 RMSE 最小。
+   """
+   if fusion_kwargs is None:
+       fusion_kwargs = {}
+
+   obs = np.asarray(obs, dtype=float)
+   val_idx_local = _to_index_array(val_mask_or_idx)
+
+   rows = []
+   best_score = np.inf
+   best_q = None
+   best_r = None
+
+   for q in q_grid:
+       for r in r_grid:
+           try:
+               _, fc_prior, _ = kalman_dynamic_fusion(
+                   fc_list,
+                   obs,
+                   q_w=float(q),
+                   r_w=float(r),
+                   **fusion_kwargs
+               )
+
+               mae, mse, rmse = calc_stats(
+                   fc_prior[val_idx_local],
+                   obs[val_idx_local]
+               )
+
+               row = {
+                   "Q": float(q),
+                   "R": float(r),
+                   "Val_MAE": float(mae),
+                   "Val_RMSE": float(rmse),
+               }
+               rows.append(row)
+
+               if rmse < best_score:
+                   best_score = rmse
+                   best_q = float(q)
+                   best_r = float(r)
+
+           except Exception as e:
+               rows.append({
+                   "Q": float(q),
+                   "R": float(r),
+                   "Val_MAE": np.nan,
+                   "Val_RMSE": np.nan,
+                   "Error": str(e),
+               })
+
+   tuning_df = pd.DataFrame(rows)
+   tuning_df["Selected"] = (
+       (tuning_df["Q"] == best_q) &
+       (tuning_df["R"] == best_r)
+   )
+
+   best_row = tuning_df[tuning_df["Selected"]].iloc[0].to_dict()
+
+   return best_q, best_r, tuning_df, best_row
 
 def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
-                          test_start_time, window_size, ramp_th):
+                            test_start_time, window_size, ramp_th):
    """
-   ✅ 固定只用 2023 年训练 ramp-skill（不看 2024 验证/测试）
+   使用 2023 年内部训练/验证得到模型的 ramp skill。
+   skill 定义为 Ramp-Up 和 Ramp-Down 两类事件 F1 的平均值：
+       RampSkill = 0.5 * (F1_up + F1_down)
+
+   该值后续进入 RAMP 增强融合，用于调节突变时刻的候选模型先验权重。
    """
    fc_series = np.asarray(fc_series, dtype=float)
    obs_series = np.asarray(obs_series, dtype=float)
    time_series = pd.to_datetime(time_series)
    n = len(fc_series)
+
    if n < window_size + 30:
        return 1.0
 
-   # 训练结束固定为 2024-01-01（只用 2023）
    train_end_time = pd.Timestamp("2024-01-01 00:00:00")
    train_end_time = min(train_end_time, test_start_time)
 
@@ -324,10 +902,11 @@ def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
    if train_mask_all_ts.sum() < 50:
        return 1.0
 
-   # 标签（3类）
+   # 3 类 ramp 标签：0=No-Ramp, 1=Ramp-Up, 2=Ramp-Down
    P_obs = windspeed_to_power(obs_series)
    obs_diff = np.diff(P_obs)
    ramp_labels = np.zeros_like(obs_series, dtype=int)
+
    if len(obs_diff) > 0:
        up_mask = obs_diff >= ramp_th
        down_mask = obs_diff <= -ramp_th
@@ -369,6 +948,7 @@ def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
    split = int(len(train_idx_local) * 0.8)
    idx_train = train_idx_local[:split]
    idx_val = train_idx_local[split:]
+
    if len(idx_val) == 0:
        return 1.0
 
@@ -388,8 +968,61 @@ def compute_ramp_skill_lstm(fc_series, obs_series, time_series,
        verbose=0
    )
 
-   _, acc = model.evaluate(X_seq[idx_val], y_seq_cat[idx_val], verbose=0)
-   return float(acc)
+   y_prob = model.predict(X_seq[idx_val], verbose=0)
+   y_pred = np.argmax(y_prob, axis=1)
+   y_true = y_seq[idx_val]
+
+   m = compute_multi_metrics(y_true, y_pred)
+
+   event_f1 = 0.5 * (m["f11"] + m["f12"])
+
+   # 如果内部验证段 ramp 样本太少，Event_F1 会不稳定，用 Macro_F1 兜底
+   event_count = np.sum(y_true != 0)
+   if event_count < 5:
+       skill = m["macro_f1"]
+   else:
+       skill = event_f1
+
+   return float(np.clip(skill, 1e-3, 1.0))
+
+def build_ramp_skill_weight_vector(cand_names, ramp_skills, neutral="median"):
+   """
+   将 ramp_skills 字典转换成与 cand_names 对齐的权重向量。
+
+   对于没有单独计算 ramp skill 的候选模型，例如 KF、EMA、融合模型，
+   使用已计算 skill 的中位数作为中性值，避免它们被人为奖励或惩罚。
+   """
+   valid_skills = [
+       float(v) for v in ramp_skills.values()
+       if np.isfinite(v) and float(v) > 0
+   ]
+
+   if len(valid_skills) == 0:
+       neutral_value = 1.0
+   else:
+       if neutral == "mean":
+           neutral_value = float(np.mean(valid_skills))
+       else:
+           neutral_value = float(np.median(valid_skills))
+
+   skill_vec = []
+
+   for name in cand_names:
+       if name in ramp_skills:
+           v = float(ramp_skills[name])
+       else:
+           v = neutral_value
+
+       if not np.isfinite(v) or v <= 0:
+           v = neutral_value
+
+       skill_vec.append(v)
+
+   skill_vec = np.asarray(skill_vec, dtype=float)
+   skill_vec = np.maximum(skill_vec, 1e-3)
+
+   return skill_vec
+
 
 
 def _enforce_min_weights(w, indices, min_w):
@@ -431,6 +1064,83 @@ def _enforce_min_weights(w, indices, min_w):
        w /= s
    return w
 
+def _enforce_group_min_weight(w, indices, min_total_w, ref_weights=None):
+   """
+   对一组模型施加总权重下限，而不是对每个模型施加相同下限。
+
+   例如：
+   indices = [LSTM, TCN, LGBM]
+   min_total_w = 0.6
+
+   表示 LSTM + TCN + LGBM 的总权重至少为 0.6。
+   组内分配可由 ref_weights 控制，例如 ramp_skill_factor。
+   """
+   w = np.asarray(w, dtype=float).copy()
+
+   if indices is None or len(indices) == 0:
+       s = w.sum()
+       return w / s if s > 0 else w
+
+   indices = [idx for idx in indices if 0 <= idx < len(w)]
+   if not indices:
+       s = w.sum()
+       return w / s if s > 0 else w
+
+   min_total_w = float(min_total_w)
+   min_total_w = np.clip(min_total_w, 0.0, 0.999)
+
+   w = np.maximum(w, 0.0)
+   s = w.sum()
+   if s > 0:
+       w /= s
+   else:
+       w[:] = 1.0 / len(w)
+
+   group_sum = w[indices].sum()
+
+   # 如果该组权重已经超过下限，不再强行修改
+   if group_sum >= min_total_w:
+       return w
+
+   other_indices = [i for i in range(len(w)) if i not in indices]
+
+   # 组内分配方式：优先按照 ref_weights，例如 ramp_skill_factor
+   if ref_weights is not None:
+       ref_weights = np.asarray(ref_weights, dtype=float)
+       group_ref = ref_weights[indices].copy()
+       group_ref = np.maximum(group_ref, 1e-8)
+   else:
+       group_ref = w[indices].copy()
+       group_ref = np.maximum(group_ref, 1e-8)
+
+   group_ref_sum = group_ref.sum()
+   if group_ref_sum > 0:
+       group_ref /= group_ref_sum
+   else:
+       group_ref[:] = 1.0 / len(group_ref)
+
+   w_new = np.zeros_like(w)
+
+   # 组内权重按照 ramp skill 分配
+   w_new[indices] = min_total_w * group_ref
+
+   # 组外模型分享剩余权重
+   remain = 1.0 - min_total_w
+   other_sum = w[other_indices].sum()
+
+   if len(other_indices) > 0:
+       if other_sum > 0:
+           w_new[other_indices] = remain * w[other_indices] / other_sum
+       else:
+           w_new[other_indices] = remain / len(other_indices)
+
+   s = w_new.sum()
+   if s > 0:
+       w_new /= s
+   else:
+       w_new[:] = 1.0 / len(w_new)
+
+   return w_new
 
 def kalman_dynamic_fusion(
    fc_list,
@@ -448,11 +1158,20 @@ def kalman_dynamic_fusion(
    min_ramp_down_weight_indices=None,
    min_weight_up=0.3,
    min_weight_down=0.3,
+   ramp_skill_weights=None,
+   use_ramp_skill=True,
+   ramp_skill_flags=(1, 2),
+   use_group_min_weight=True,
 ):
    obs = np.asarray(obs, dtype=float)
    fc_arrs = [np.asarray(fc, dtype=float) for fc in fc_list]
+
    n = len(obs)
    M = len(fc_arrs)
+
+   for i, fc in enumerate(fc_arrs):
+       if len(fc) != n:
+           raise ValueError(f"第 {i} 个候选序列长度 {len(fc)} 与 obs 长度 {n} 不一致")
 
    w = np.ones(M) / M
    P = np.eye(M) * 100.0
@@ -465,6 +1184,7 @@ def kalman_dynamic_fusion(
    fc_fuse_post = np.zeros(n)
 
    has_ramp_logic = ramp_flags is not None
+
    if has_ramp_logic:
        ramp_flags = np.asarray(ramp_flags, dtype=int)
        if len(ramp_flags) != n:
@@ -474,25 +1194,72 @@ def kalman_dynamic_fusion(
    ramp_down_indices = set(ramp_down_indices or [])
    calm_pref_indices = set(calm_pref_indices or [])
 
-   for t in range(n):
-       H = np.array([fc_arrs[m][t] for m in range(M)]).reshape(1, -1)
+   if ramp_skill_weights is not None:
+       ramp_skill_weights = np.asarray(ramp_skill_weights, dtype=float)
 
-       w_pred = w
+       if len(ramp_skill_weights) != M:
+           raise ValueError("ramp_skill_weights 长度必须与 fc_list 候选模型数量一致")
+
+       ramp_skill_weights = np.where(
+           np.isfinite(ramp_skill_weights),
+           ramp_skill_weights,
+           np.nan
+       )
+
+       if np.all(np.isnan(ramp_skill_weights)):
+           ramp_skill_weights = np.ones(M)
+       else:
+           fill_value = np.nanmedian(ramp_skill_weights)
+           ramp_skill_weights = np.where(
+               np.isnan(ramp_skill_weights),
+               fill_value,
+               ramp_skill_weights
+           )
+
+       ramp_skill_weights = np.maximum(ramp_skill_weights, 1e-3)
+
+       # 均值归一化，只改变相对权重，不改变整体尺度
+       ramp_skill_factor = ramp_skill_weights / np.mean(ramp_skill_weights)
+   else:
+       ramp_skill_factor = None
+
+   ramp_skill_flags = set(ramp_skill_flags or [])
+
+   for t in range(n):
+       H = np.array([fc_arrs[m][t] for m in range(M)], dtype=float).reshape(1, -1)
+
+       w_pred = w.copy()
        P_pred = P + Q
 
+       # ===============================
+       # 1. RAMP / CALM 先验 boost
+       # ===============================
        if has_ramp_logic:
            if ramp_flags[t] == 1:
                for idx in ramp_up_indices:
                    if 0 <= idx < M:
                        w_pred[idx] *= ramp_up_boost_factor
+
            elif ramp_flags[t] == 2:
                for idx in ramp_down_indices:
                    if 0 <= idx < M:
                        w_pred[idx] *= ramp_down_boost_factor
+
            else:
                for idx in calm_pref_indices:
                    if 0 <= idx < M:
                        w_pred[idx] *= calm_boost_factor
+
+       # ===============================
+       # 2. ramp skill 乘到先验权重
+       # ===============================
+       if (
+           has_ramp_logic
+           and use_ramp_skill
+           and ramp_skill_factor is not None
+           and ramp_flags[t] in ramp_skill_flags
+       ):
+           w_pred = w_pred * ramp_skill_factor
 
        w_pred = np.maximum(w_pred, 0.0)
        s = w_pred.sum()
@@ -501,13 +1268,22 @@ def kalman_dynamic_fusion(
        else:
            w_pred = np.ones(M) / M
 
+       # ===============================
+       # 3. Kalman prior prediction
+       # ===============================
        y_prior = float(H @ w_pred.reshape(-1, 1))
        fc_fuse_prior[t] = y_prior
 
        S = float(H @ P_pred @ H.T + R)
+       if (not np.isfinite(S)) or S <= 1e-12:
+           S = 1e-12
+
        K = (P_pred @ H.T) / S
 
-       w = w_pred + (K.flatten() * (obs[t] - y_prior))
+       # ===============================
+       # 4. Kalman update
+       # ===============================
+       w = w_pred + K.flatten() * (obs[t] - y_prior)
        P = (I - K @ H) @ P_pred
 
        w = np.maximum(w, 0.0)
@@ -517,11 +1293,40 @@ def kalman_dynamic_fusion(
        else:
            w = np.ones(M) / M
 
+       # ===============================
+       # 5. RAMP 模型组权重下限
+       # 注意：这里只在 has_ramp_logic=True 时执行
+       # ===============================
        if has_ramp_logic:
            if ramp_flags[t] == 1 and min_ramp_up_weight_indices:
-               w = _enforce_min_weights(w, min_ramp_up_weight_indices, min_weight_up)
+               if use_group_min_weight:
+                   w = _enforce_group_min_weight(
+                       w,
+                       min_ramp_up_weight_indices,
+                       min_total_w=min_weight_up,
+                       ref_weights=ramp_skill_factor
+                   )
+               else:
+                   w = _enforce_min_weights(
+                       w,
+                       min_ramp_up_weight_indices,
+                       min_weight_up
+                   )
+
            elif ramp_flags[t] == 2 and min_ramp_down_weight_indices:
-               w = _enforce_min_weights(w, min_ramp_down_weight_indices, min_weight_down)
+               if use_group_min_weight:
+                   w = _enforce_group_min_weight(
+                       w,
+                       min_ramp_down_weight_indices,
+                       min_total_w=min_weight_down,
+                       ref_weights=ramp_skill_factor
+                   )
+               else:
+                   w = _enforce_min_weights(
+                       w,
+                       min_ramp_down_weight_indices,
+                       min_weight_down
+                   )
 
        w_hist[t, :] = w
        fc_fuse_post[t] = float(H @ w.reshape(-1, 1))
@@ -594,10 +1399,38 @@ obs_file = "wind_timeseries.xlsx"
 
 WINDOW_SIZE = 24
 
+ALPHA_EMA = 0.1
+
+# ==============================
+# ✅ Q/R 系统化选择：验证集网格搜索
+# 训练集用于估计误差尺度，验证集用于选择 Q/R，测试集不参与调参
+# ==============================
+USE_AUTO_QR_TUNING = True
+
+# KF bias regression 的 Q 候选
+KF_Q_GRID = np.array([
+    1e-6, 3e-6,
+    1e-5, 3e-5,
+    1e-4, 3e-4,
+    1e-3, 3e-3,
+    1e-2
+], dtype=float)
+
+# Dynamic fusion weight 的 Q 候选
+FUSION_QW_GRID = np.array([
+    1e-7, 3e-7,
+    1e-6, 3e-6,
+    1e-5, 3e-5,
+    1e-4, 3e-4,
+    1e-3
+], dtype=float)
+
+# R 不再固定给 1.0，而是根据训练集残差方差自适应生成
+R_GRID_MULTIPLIERS = np.array([0.1, 0.3, 1.0, 3.0, 10.0], dtype=float)
+
+# 如果关闭自动调参，则使用下面默认值
 KF_Q = 1e-3
 KF_R = 1.0
-
-ALPHA_EMA = 0.1
 
 FUSION_QW = 1e-4
 FUSION_RW = 1.0
@@ -622,6 +1455,11 @@ FUSE_TOPK = 8
 summary_rows = []
 ramp_metrics_summary_rows = []
 
+# 保存每个 lead、每个模块自动选择的 Q/R
+qr_tuning_summary_rows = []
+qr_tuning_detail_dfs = []
+ramp_minweight_tuning_summary_rows = []
+ramp_minweight_tuning_detail_dfs = []
 
 # ==============================
 # 读取实况
@@ -712,14 +1550,66 @@ for lead_hour, fcst_file in lead_pairs.items():
    feature_cols = [c for c in eff_tmp.columns if c not in ["Time", "Obs"]]
    X_lgb0 = eff_tmp[feature_cols].values
 
-   # ========= Step 2: KF / EMA =========
+      # ========= Step 2: KF / EMA =========
    yt0 = bias_eff0
    Zt0 = np.column_stack([np.ones(n0), fc_eff0])
-   _, bias_pred_kf0, _ = kalman_regression(yt0, Zt0, q=KF_Q, r=KF_R)
+
+   time_eff0_pd = pd.to_datetime(time_eff0)
+   train_mask_eff0 = (time_eff0_pd >= TRAIN_START) & (time_eff0_pd <= TRAIN_END)
+   val_mask_eff0   = (time_eff0_pd >= VAL_START)   & (time_eff0_pd <= VAL_END)
+
+   # R 的候选值根据训练集原始残差方差自适应生成
+   kf_r_grid = make_adaptive_r_grid(
+       residual=bias_eff0[train_mask_eff0],
+       multipliers=R_GRID_MULTIPLIERS
+   )
+
+   if USE_AUTO_QR_TUNING:
+       best_kf_q, best_kf_r, kf_tuning_df, best_kf_row = select_kf_qr_by_validation(
+           yt=yt0,
+           Zt=Zt0,
+           fc=fc_eff0,
+           obs=obs_eff0,
+           val_mask_or_idx=val_mask_eff0,
+           q_grid=KF_Q_GRID,
+           r_grid=kf_r_grid
+       )
+
+       print(
+           f"  → KF Q/R 自动选择完成："
+           f"Q={best_kf_q:.2e}, R={best_kf_r:.3e}, "
+           f"Val_RMSE={best_kf_row['Val_RMSE']:.4f}"
+       )
+
+       kf_tuning_df.insert(0, "Lead_h", lead_hour)
+       kf_tuning_df.insert(1, "Module", "KF_bias_correction")
+       qr_tuning_detail_dfs.append(kf_tuning_df)
+
+       qr_tuning_summary_rows.append({
+           "Lead_h": lead_hour,
+           "Module": "KF_bias_correction",
+           "Selected_Q": best_kf_q,
+           "Selected_R": best_kf_r,
+           "Val_MAE": best_kf_row["Val_MAE"],
+           "Val_RMSE": best_kf_row["Val_RMSE"],
+       })
+
+   else:
+       best_kf_q = KF_Q
+       best_kf_r = KF_R
+
+   _, bias_pred_kf0, _ = kalman_regression(
+       yt0,
+       Zt0,
+       q=best_kf_q,
+       r=best_kf_r
+   )
    fc_kf_eff0 = fc_eff0 - bias_pred_kf0
 
+   # EMA 不含 Q/R，保持原设定
    bias_pred_EMA0 = EMA_bias_prediction(fc_eff0, obs_eff0, alpha=ALPHA_EMA)
    fc_EMA_eff0 = fc_eff0 - bias_pred_EMA0
+
 
    # ========= Step 3: LSTM / TCN =========
    if n0 <= WINDOW_SIZE + 30:
@@ -918,32 +1808,100 @@ for lead_hour, fcst_file in lead_pairs.items():
        fc_lgb_eff, obs_seq, time_series, TEST_START, WINDOW_SIZE, RAMP_TH
    )
    for k, v in ramp_skills.items():
-       print(f"    模型 {k} 的 ramp 识别准确率 = {v:.3f}")
+      print(f"    模型 {k} 的 ramp skill(Event-F1) = {v:.3f}")
+
+   # ========= Step 7.0: 融合层 Q/R 自动选择函数 =========
+   def tune_and_run_fusion(module_name, cand_list, fusion_kwargs=None):
+       """
+       对某一个融合模块自动选择 Q/R，然后用最优 Q/R 重新运行完整时序。
+       """
+       if fusion_kwargs is None:
+           fusion_kwargs = {}
+
+       cand_mat = np.column_stack(cand_list)
+       mean_candidate = np.mean(cand_mat, axis=1)
+
+       # R 的候选值根据训练集融合候选平均误差方差自适应生成
+       fusion_r_grid = make_adaptive_r_grid(
+           residual=mean_candidate[train_idx] - obs_seq[train_idx],
+           multipliers=R_GRID_MULTIPLIERS
+       )
+
+       if USE_AUTO_QR_TUNING:
+           best_q, best_r, tuning_df, best_row = select_fusion_qr_by_validation(
+               fc_list=cand_list,
+               obs=obs_seq,
+               val_mask_or_idx=val_idx,
+               q_grid=FUSION_QW_GRID,
+               r_grid=fusion_r_grid,
+               fusion_kwargs=fusion_kwargs
+           )
+
+           print(
+               f"  → {module_name} Q/R 自动选择完成："
+               f"Q={best_q:.2e}, R={best_r:.3e}, "
+               f"Val_RMSE={best_row['Val_RMSE']:.4f}"
+           )
+
+           tuning_df.insert(0, "Lead_h", lead_hour)
+           tuning_df.insert(1, "Module", module_name)
+           qr_tuning_detail_dfs.append(tuning_df)
+
+           qr_tuning_summary_rows.append({
+               "Lead_h": lead_hour,
+               "Module": module_name,
+               "Selected_Q": best_q,
+               "Selected_R": best_r,
+               "Val_MAE": best_row["Val_MAE"],
+               "Val_RMSE": best_row["Val_RMSE"],
+           })
+
+       else:
+           best_q = FUSION_QW
+           best_r = FUSION_RW
+
+       w_hist, fc_prior, fc_post = kalman_dynamic_fusion(
+           cand_list,
+           obs_seq,
+           q_w=best_q,
+           r_w=best_r,
+           **fusion_kwargs
+       )
+
+       return w_hist, fc_prior, fc_post, best_q, best_r
 
    # ========= Step 7: 常规模型融合 1/2/3/5 =========
    cand_list_1 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff]
-   w_hist_1, fc_fuse1_prior, _ = kalman_dynamic_fusion(
-       cand_list_1, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
+   w_hist_1, fc_fuse1_prior, _, best_q_fuse1, best_r_fuse1 = tune_and_run_fusion(
+       module_name="FUSE_KF_EMA_LSTM",
+       cand_list=cand_list_1
    )
    fc_opt1 = fc_fuse1_prior
 
+
    cand_list_2 = [fc_kf_eff, fc_EMA_eff, fc_lgb_eff]
-   w_hist_2, fc_fuse2_prior, _ = kalman_dynamic_fusion(
-       cand_list_2, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
+   w_hist_2, fc_fuse2_prior, _, best_q_fuse2, best_r_fuse2 = tune_and_run_fusion(
+       module_name="FUSE_KF_EMA_LGBM",
+       cand_list=cand_list_2
    )
    fc_opt2 = fc_fuse2_prior
 
+
    cand_list_3 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff, fc_lgb_eff]
-   w_hist_3, fc_fuse3_prior, _ = kalman_dynamic_fusion(
-       cand_list_3, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
+   w_hist_3, fc_fuse3_prior, _, best_q_fuse3, best_r_fuse3 = tune_and_run_fusion(
+       module_name="FUSE_KF_EMA_LSTM_LGBM",
+       cand_list=cand_list_3
    )
    fc_opt3 = fc_fuse3_prior
 
+
    cand_list_5 = [fc_kf_eff, fc_EMA_eff, fc_lstm_eff, fc_tcn_eff]
-   w_hist_5, fc_fuse5_prior, _ = kalman_dynamic_fusion(
-       cand_list_5, obs_seq, q_w=FUSION_QW, r_w=FUSION_RW
+   w_hist_5, fc_fuse5_prior, _, best_q_fuse5, best_r_fuse5 = tune_and_run_fusion(
+       module_name="FUSE_KF_EMA_LSTM_TCN",
+       cand_list=cand_list_5
    )
    fc_opt5 = fc_fuse5_prior
+
 
    # ========= Step 7.4: 固定候选模型 =========
    cand_names_4 = [
@@ -975,6 +1933,16 @@ for lead_hour, fcst_file in lead_pairs.items():
    print("  用于 RAMP 增强融合的固定候选模型：", ", ".join(cand_names_4))
 
    name_to_idx = {name: i for i, name in enumerate(cand_names_4)}
+   # ========= 将 ramp_skills 转成与 cand_names_4 对齐的权重向量 =========
+   ramp_skill_weight_vec = build_ramp_skill_weight_vector(
+       cand_names=cand_names_4,
+       ramp_skills=ramp_skills,
+       neutral="median"
+   )
+
+   print("  RAMP skill 权重向量：")
+   for name, skill in zip(cand_names_4, ramp_skill_weight_vec):
+       print(f"    {name:24s}: {skill:.3f}")
 
    ramp_up_indices = [
 
@@ -990,10 +1958,13 @@ for lead_hour, fcst_file in lead_pairs.items():
 
    min_ramp_up_weight_indices = [
        name_to_idx["LSTM"],
+       name_to_idx["LGBM"],
+       name_to_idx["TCN"],
    ]
    min_ramp_down_weight_indices = [
        name_to_idx["LSTM"],
        name_to_idx["LGBM"],
+       name_to_idx["TCN"],
    ]
 
    ramp_flag_pred = np.zeros_like(fc_lstm_eff, dtype=int)
@@ -1009,11 +1980,32 @@ for lead_hour, fcst_file in lead_pairs.items():
        ramp_flag_pred[1:][down_mask] = 2
    ramp_flag_pred[0] = 0
 
-   w_hist_4, fc_fuse4_prior, _ = kalman_dynamic_fusion(
-       cand_list_4,
-       obs_seq,
-       q_w=FUSION_QW,
-       r_w=FUSION_RW,
+   # ========= Step 7.6: RAMP 增强融合 Q/R + 组权重下限联合调优 =========
+   print("  → 使用验证集联合调优 FUSE_RAMP_ENHANCED 的 Q/R 和 ramp 模型组权重下限...")
+
+   cand_mat_4 = np.column_stack(cand_list_4)
+   mean_candidate_4 = np.mean(cand_mat_4, axis=1)
+
+   fusion4_r_grid = make_adaptive_r_grid(
+   residual=mean_candidate_4[train_idx] - obs_seq[train_idx],
+   multipliers=R_GRID_MULTIPLIERS
+   )
+
+   if USE_AUTO_QR_TUNING:
+      (
+       best_q_fuse4,
+       best_r_fuse4,
+       best_min_weight_up,
+       best_min_weight_down,
+       ramp_groupmin_tuning_df,
+       best_ramp_groupmin_row
+      ) = select_ramp_fusion_qr_groupmin_by_validation(
+       fc_list=cand_list_4,
+       obs=obs_seq,
+       val_mask_or_idx=val_idx,
+       q_grid=FUSION_QW_GRID,
+       r_grid=fusion4_r_grid,
+
        ramp_flags=ramp_flag_pred,
        ramp_up_indices=ramp_up_indices,
        ramp_down_indices=ramp_down_indices,
@@ -1021,13 +2013,77 @@ for lead_hour, fcst_file in lead_pairs.items():
        ramp_up_boost_factor=RAMP_UP_BOOST_FACTOR,
        ramp_down_boost_factor=RAMP_DOWN_BOOST_FACTOR,
        calm_boost_factor=CALM_BOOST_FACTOR,
+
        min_ramp_up_weight_indices=min_ramp_up_weight_indices,
        min_ramp_down_weight_indices=min_ramp_down_weight_indices,
-       min_weight_up=0.9,
-       min_weight_down=0.45,
-   )
+
+       ramp_skill_weights=ramp_skill_weight_vec,
+       ramp_th=RAMP_TH,
+
+       min_up_grid=RAMP_GROUP_MIN_UP_GRID,
+       min_down_grid=RAMP_GROUP_MIN_DOWN_GRID,
+       rmse_tolerance=RAMP_GROUP_MIN_RMSE_TOLERANCE,
+      )
+
+      print(
+       f"  → FUSE_RAMP_ENHANCED 联合调优完成："
+       f"Q={best_q_fuse4:.2e}, "
+       f"R={best_r_fuse4:.3e}, "
+       f"min_weight_up={best_min_weight_up:.2f}, "
+       f"min_weight_down={best_min_weight_down:.2f}, "
+       f"Val_Event_F1={best_ramp_groupmin_row['Val_Event_F1']:.4f}, "
+       f"Val_RMSE={best_ramp_groupmin_row['Val_RMSE']:.4f}"
+      )
+
+      ramp_groupmin_tuning_df.insert(0, "Lead_h", lead_hour)
+      ramp_groupmin_tuning_df.insert(1, "Module", "FUSE_RAMP_ENHANCED")
+
+   else:
+      best_q_fuse4 = FUSION_QW
+      best_r_fuse4 = FUSION_RW
+
+      # 关闭自动调参时才使用默认值
+      best_min_weight_up = 0.0
+      best_min_weight_down = 0.0
+
+
+   # ========= Step 7.7: 使用验证集选出的参数运行完整时序 =========
+   ramp_fusion_kwargs = {
+   "ramp_flags": ramp_flag_pred,
+   "ramp_up_indices": ramp_up_indices,
+   "ramp_down_indices": ramp_down_indices,
+   "calm_pref_indices": calm_pref_indices,
+   "ramp_up_boost_factor": RAMP_UP_BOOST_FACTOR,
+   "ramp_down_boost_factor": RAMP_DOWN_BOOST_FACTOR,
+   "calm_boost_factor": CALM_BOOST_FACTOR,
+
+   "min_ramp_up_weight_indices": min_ramp_up_weight_indices,
+   "min_ramp_down_weight_indices": min_ramp_down_weight_indices,
+
+   # 注意：这是验证集选出的 ramp 模型组总权重下限
+   "min_weight_up": best_min_weight_up,
+   "min_weight_down": best_min_weight_down,
+
+   "ramp_skill_weights": ramp_skill_weight_vec,
+   "use_ramp_skill": True,
+   "ramp_skill_flags": (1, 2),
+
+   # 使用组权重下限，不使用逐模型下限
+   "use_group_min_weight": True,
+}
+
+   w_hist_4, fc_fuse4_prior, _ = kalman_dynamic_fusion(
+   cand_list_4,
+   obs_seq,
+   q_w=best_q_fuse4,
+   r_w=best_r_fuse4,
+   **ramp_fusion_kwargs
+)
 
    fc_opt4 = fc_fuse4_prior
+
+
+
 
    print("  动态融合1(KF+EMA+LSTM) 平均权重：", ", ".join(f"{w:.3f}" for w in w_hist_1.mean(axis=0)))
    print("  动态融合2(KF+EMA+LGBM) 平均权重：", ", ".join(f"{w:.3f}" for w in w_hist_2.mean(axis=0)))
@@ -1314,6 +2370,31 @@ for lead_hour, fcst_file in lead_pairs.items():
            })
        metrics_df = pd.DataFrame(metrics_rows)
        metrics_df.to_excel(writer, sheet_name="RampMetrics_TEST", index=False)
+              # 当前 lead 的 Q/R 调参明细
+       qr_detail_this_lead = [
+           df_qr for df_qr in qr_tuning_detail_dfs
+           if int(df_qr["Lead_h"].iloc[0]) == int(lead_hour)
+       ]
+
+       if qr_detail_this_lead:
+           pd.concat(qr_detail_this_lead, ignore_index=True).to_excel(
+               writer,
+               sheet_name="QR_Tuning",
+               index=False
+           )
+        # 当前 lead 的 RAMP 最小权重调参明细
+       ramp_minweight_detail_this_lead = [
+        df_mw for df_mw in ramp_minweight_tuning_detail_dfs
+        if int(df_mw["Lead_h"].iloc[0]) == int(lead_hour)
+        ]
+
+       if ramp_minweight_detail_this_lead:
+        pd.concat(ramp_minweight_detail_this_lead, ignore_index=True).to_excel(
+            writer,
+            sheet_name="Ramp_MinWeight_Tuning",
+            index=False
+        )
+
 
    print(f"  → 已保存 Excel：{out_name}")
 
@@ -1612,6 +2693,55 @@ if ramp_metrics_summary_rows:
     )
     print("\n=== Lead-wise Ramp Classification Metrics (Acc / Macro P-R-F1 / Per-Class P-R-F1) ===")
     print(metrics_summary_df)
+
+# ===============================================================
+#                 Q/R Tuning Summary
+# ===============================================================
+if qr_tuning_summary_rows:
+    qr_summary_df = pd.DataFrame(qr_tuning_summary_rows)
+    qr_summary_df = qr_summary_df.sort_values(["Lead_h", "Module"])
+
+    qr_summary_df.to_excel(
+        "Kalman_QR_Tuning_Selected_Summary.xlsx",
+        index=False
+    )
+
+    print("\n=== Selected Q/R Summary ===")
+    print(qr_summary_df)
+
+if qr_tuning_detail_dfs:
+    qr_detail_all_df = pd.concat(qr_tuning_detail_dfs, ignore_index=True)
+
+    qr_detail_all_df.to_excel(
+        "Kalman_QR_Tuning_GridSearch_Details.xlsx",
+        index=False
+    )
+
+# ===============================================================
+#                 RAMP Min-Weight Tuning Summary
+# ===============================================================
+if ramp_minweight_tuning_summary_rows:
+    ramp_minweight_summary_df = pd.DataFrame(ramp_minweight_tuning_summary_rows)
+    ramp_minweight_summary_df = ramp_minweight_summary_df.sort_values(["Lead_h", "Module"])
+
+    ramp_minweight_summary_df.to_excel(
+        "Ramp_MinWeight_Tuning_Selected_Summary.xlsx",
+        index=False
+    )
+
+    print("\n=== Selected RAMP Min-Weight Summary ===")
+    print(ramp_minweight_summary_df)
+
+if ramp_minweight_tuning_detail_dfs:
+    ramp_minweight_detail_all_df = pd.concat(
+        ramp_minweight_tuning_detail_dfs,
+        ignore_index=True
+    )
+
+    ramp_minweight_detail_all_df.to_excel(
+        "Ramp_MinWeight_Tuning_GridSearch_Details.xlsx",
+        index=False
+    )
 
 plt.show()
 print("\nAll figures generated successfully. ✅")
